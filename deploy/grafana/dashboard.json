@@ -1,0 +1,10 @@
+{
+  "title": "Vsector Metrics",
+  "panels": [
+    {"title": "Ingest QPS", "targets": [{"expr": "rate(vsector_ingest_total[1m])"}]},
+    {"title": "Query Latency P99", "targets": [{"expr": "histogram_quantile(0.99, rate(vsector_query_latency_ms_bucket[5m]))"}]},
+    {"title": "Vectors per Shard", "targets": [{"expr": "vsector_index_vectors"}]},
+    {"title": "WAL Bytes", "targets": [{"expr": "vsector_wal_bytes"}]},
+    {"title": "Shard Count", "targets": [{"expr": "vsector_shard_count"}]}
+  ]
+}
