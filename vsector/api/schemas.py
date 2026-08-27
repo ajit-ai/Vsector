@@ -13,6 +13,7 @@ class NamespaceCreate(BaseModel):
     replication_factor: int = 3
     shard_count: int = 8
     compression: str = "NONE"
+    expected_records: int | None = None
 
 
 class UpsertRequest(BaseModel):

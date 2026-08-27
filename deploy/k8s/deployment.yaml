@@ -18,6 +18,10 @@ spec:
           readinessProbe: {httpGet: {path: /ready, port: 8080}, initialDelaySeconds: 5}
           volumeMounts: [{name: data, mountPath: /data}]
           resources: {requests: {cpu: "2", memory: "4Gi"}, limits: {cpu: "4", memory: "8Gi"}}
+          # cost-based: shard_count auto-tuned via Namespace.expected_records, HPA scales shards
+          env:
+            - {name: VSECTOR_SHARD_MAX_VECTORS, value: "50000000000"}
+            - {name: VSECTOR_RERANK, value: "mmr"}
       volumes: [{name: data, persistentVolumeClaim: {claimName: vsector-pvc}}]
 ---
 apiVersion: v1
