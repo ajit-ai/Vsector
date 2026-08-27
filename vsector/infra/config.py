@@ -63,9 +63,14 @@ class Settings(BaseSettings):
     # S3
     s3_endpoint_url: str = ""  # for MinIO
 
+    # Re-ranking
+    rerank: str = ""  # cross_encoder | mmr
+    mmr_lambda: float = 0.5
+
     # Observability
     otel_endpoint: str = ""
     log_level: str = "INFO"
+    log_json: bool = False
 
     model_config = {"env_prefix": "VSECTOR_", "env_file": ".env", "extra": "ignore"}
 
