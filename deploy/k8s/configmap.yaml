@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: vsector-config}
+data:
+  OTEL_ENDPOINT: "http://jaeger:4317"
+  LOG_LEVEL: "INFO"
+  GRAFANA_DASHBOARD: |
+    { "title": "Vsector" }
