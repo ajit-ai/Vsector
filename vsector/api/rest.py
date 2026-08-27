@@ -35,6 +35,13 @@ router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s)
 ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir)
 query_engine = QueryEngine(metadata=metadata_store, router=router, ingest_service=ingest)
 
+# Hydrate shards from persisted namespaces on startup (fixes metadata.json persistence vs in-memory etcd)
+for _ns in metadata_store.list():
+    if not router.etcd.list_by_namespace(_ns.name):
+        for i in range(_ns.shard_count):
+            _shard = Shard(namespace=_ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
+            router.register_shard(_shard)
+
 app = FastAPI(
     title="Vsector Vector Database",
     version=settings.version,
