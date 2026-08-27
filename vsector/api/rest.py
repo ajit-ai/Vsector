@@ -24,7 +24,10 @@ from ..models.namespace import Namespace, DistanceMetric, IndexType, Compression
 from ..ingest.service import IngestService
 from ..query.engine import QueryEngine
 from ..gateway.auth import verify_api_key, rate_limiter
+from ..infra.cdn import CDN
 from .schemas import NamespaceCreate, UpsertRequest, QueryRequest, FetchRequest, DeleteRequest
+
+cdn = CDN()
 
 settings = get_settings()
 
@@ -143,6 +146,14 @@ async def upsert_vectors(body: UpsertRequest, _auth=Depends(verify_api_key)):
         result = await ingest.upsert(body.namespace, body.vectors, idempotency_key=body.idempotency_key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Invalidate CDN edge on write
+    try:
+        from ..infra.cache import get_cache
+
+        get_cache().invalidate_namespace(body.namespace)
+        cdn.purge_namespace(body.namespace)
+    except Exception:
+        pass
     return result
 
 @app.post(f"{settings.api_prefix}/vectors/query", tags=["vectors"], dependencies=[Depends(rate_limiter)])
