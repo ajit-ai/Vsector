@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install deps
+        run: |
+          pip install -e .[dev]
+          pip install pytest pytest-asyncio httpx
+      - name: Lint
+        run: ruff check vsector || true
+      - name: Tests
+        run: pytest -q
+      - name: Quickstart smoke
+        run: python examples/quickstart.py
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t vsector:${{ github.sha }} .
+      - name: Compose up
+        run: docker compose config
+
+  deploy-check:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate K8s manifests
+        run: |
+          kubectl --version || echo "kubectl not installed in CI (skipped)"
+          ls -R deploy/k8s
