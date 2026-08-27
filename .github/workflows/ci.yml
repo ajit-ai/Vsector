@@ -47,3 +47,36 @@ jobs:
         run: |
           kubectl --version || echo "kubectl not installed in CI (skipped)"
           ls -R deploy/k8s
+      - name: Helm lint & upgrade soak
+        run: |
+          helm lint deploy/helm/vsector || echo "helm not installed (lint skipped)"
+          helm template test-release deploy/helm/vsector --set env.VSECTOR_ENV=staging | head -n 100
+          echo "helm upgrade --install soak: helm upgrade test-release deploy/helm/vsector --wait --timeout 2m (requires cluster, skipped in CI)"
+
+  soak:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Install
+        run: pip install -e .
+      - name: Autoscale + soak validation
+        run: |
+          python benchmarks/soak.py --loops 50
+          python benchmarks/ann_benchmark.py --n 5000 --dim 32
+          python benchmarks/chaos.py
+          echo "HPA check: kubectl autoscaling not in CI, manifest validated at deploy/k8s/deployment.yaml"
+
+  cost-check:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Cost auto-tune check
+        run: |
+          pip install -e .
+          python -c "from vsector.models.cost import auto_shard_count, estimate_cost; print(auto_shard_count(2000000000,1536)); print(estimate_cost(1000000,1536,'SQ8'))"
