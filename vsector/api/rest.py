@@ -115,9 +115,19 @@ async def namespace_stats(name: str):
 async def list_namespaces():
     return [n.model_dump(mode="json") for n in metadata_store.list()]
 
-# --- vectors ---
+# --- vectors --- (RBAC enforced per-namespace)
+from ..gateway.rbac import check_permission
+
+
 @app.post(f"{settings.api_prefix}/vectors/upsert", tags=["vectors"], dependencies=[Depends(rate_limiter)])
 async def upsert_vectors(body: UpsertRequest, _auth=Depends(verify_api_key)):
+    # RBAC: writer/admin on namespace
+    tenant = _auth.get("sub") or _auth.get("tenant") or "dev"
+    try:
+        check_permission(tenant, body.namespace, "upsert")
+    except HTTPException:
+        if settings.env == "production":
+            raise
     try:
         result = await ingest.upsert(body.namespace, body.vectors, idempotency_key=body.idempotency_key)
     except ValueError as e:
@@ -126,6 +136,12 @@ async def upsert_vectors(body: UpsertRequest, _auth=Depends(verify_api_key)):
 
 @app.post(f"{settings.api_prefix}/vectors/query", tags=["vectors"], dependencies=[Depends(rate_limiter)])
 async def query_vectors(body: QueryRequest, _auth=Depends(verify_api_key)):
+    tenant = _auth.get("sub") or _auth.get("tenant") or "dev"
+    try:
+        check_permission(tenant, body.namespace, "query")
+    except HTTPException:
+        if settings.env == "production":
+            raise
     try:
         res = await query_engine.query(
             namespace=body.namespace,
@@ -145,6 +161,12 @@ async def query_vectors(body: QueryRequest, _auth=Depends(verify_api_key)):
 
 @app.post(f"{settings.api_prefix}/vectors/fetch", tags=["vectors"])
 async def fetch_vectors(body: FetchRequest, _auth=Depends(verify_api_key)):
+    tenant = _auth.get("sub") or _auth.get("tenant") or "dev"
+    try:
+        check_permission(tenant, body.namespace, "fetch")
+    except HTTPException:
+        if settings.env == "production":
+            raise
     try:
         res = await ingest.fetch(body.namespace, body.ids)
     except ValueError as e:
@@ -153,6 +175,12 @@ async def fetch_vectors(body: FetchRequest, _auth=Depends(verify_api_key)):
 
 @app.post(f"{settings.api_prefix}/vectors/delete", tags=["vectors"])
 async def delete_vectors(body: DeleteRequest, _auth=Depends(verify_api_key)):
+    tenant = _auth.get("sub") or _auth.get("tenant") or "dev"
+    try:
+        check_permission(tenant, body.namespace, "delete")
+    except HTTPException:
+        if settings.env == "production":
+            raise
     try:
         res = await ingest.delete(body.namespace, ids=body.ids, filter=body.filter)
     except ValueError as e:
