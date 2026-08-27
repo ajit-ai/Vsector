@@ -78,6 +78,20 @@ class QueryEngine:
         def filter_fn(md: dict) -> bool:
             return _parse_filter(md, filters)
 
+        # Tiered cache lookup (L1 mem + L2 Redis)
+        try:
+            from ..infra.cache import get_cache
+
+            cached = get_cache().get_query(namespace, vector, top_k, filters)
+            if cached and not include_vector:
+                # cache hit — still count metrics but skip fan-out
+                QUERY_COUNTER.labels(namespace=namespace).inc()
+                if "took_ms" in cached:
+                    QUERY_LATENCY.labels(namespace=namespace).observe(cached["took_ms"])
+                return cached  # type: ignore
+        except Exception:
+            pass
+
         shards = self.router.route_for_query(namespace)
         if not shards:
             return {"results": [], "took_ms": 0, "shard_count": 0, "total_candidates_scanned": 0}
@@ -153,9 +167,18 @@ class QueryEngine:
 
         # consistency: STRONG would read from WAL / primary only - simulated as same
 
-        return {
+        result = {
             "results": top,
             "took_ms": took_ms,
             "shard_count": len(shards),
             "total_candidates_scanned": total_scanned,
         }
+        # Populate tiered cache
+        try:
+            from ..infra.cache import get_cache
+
+            if not include_vector:
+                get_cache().set_query(namespace, vector, top_k, filters, result)
+        except Exception:
+            pass
+        return result
