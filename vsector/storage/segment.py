@@ -86,15 +86,22 @@ class SSTable:
 
 
 class SegmentStore:
-    """Tiered: MemTable -> SSTable -> S3 (simulated by dir tiers)."""
+    """Tiered: MemTable -> SSTable (hot) -> S3 cold tier (fallback to local cold_dir)."""
 
-    def __init__(self, base_dir: str | Path, memtable_threshold: int = 10000):
+    def __init__(self, base_dir: str | Path, memtable_threshold: int = 10000, s3_bucket: str | None = None):
         self.base_dir = Path(base_dir)
         self.hot_dir = self.base_dir / "hot"
         self.cold_dir = self.base_dir / "cold"
         self.memtable = MemTable(flush_threshold=memtable_threshold)
         self._sstables: List[SSTable] = []
         self._lock = threading.Lock()
+        # S3 cold tier (optional)
+        try:
+            from .s3 import S3Tier
+
+            self.s3 = S3Tier(bucket=s3_bucket)
+        except Exception:
+            self.s3 = None  # type: ignore
         # load existing
         for d in [self.hot_dir, self.cold_dir]:
             if d.exists():
@@ -113,7 +120,24 @@ class SegmentStore:
         sst = SSTable.flush(snap, self.hot_dir)
         with self._lock:
             self._sstables.append(sst)
+        # S3 cold offload (async best-effort) — upload hot SSTable to S3
+        try:
+            if getattr(self, "s3", None) and getattr(self.s3, "enabled", False):
+                self.s3.upload(sst.path)  # type: ignore
+        except Exception:
+            pass
         return sst
+
+    def tier_to_cold(self, sst: SSTable) -> None:
+        """Move SSTable from hot to cold (local or S3)."""
+        try:
+            dest = self.cold_dir / sst.path.name
+            sst.path.rename(dest)
+            sst.path = dest
+            if getattr(self, "s3", None) and getattr(self.s3, "enabled", False):
+                self.s3.upload(dest)  # type: ignore
+        except Exception:
+            pass
 
     def get(self, id: str) -> VectorRecord | None:
         v = self.memtable.get(id)
