@@ -53,8 +53,19 @@ class WAL:
         if self._segment_file:
             self._segment_file.close()
         path = self.dir / f"wal-{self._segment_id:06d}.log"
-        self._segment_file = open(path, "ab")
+        # O_DIRECT best-effort on Linux (flag 0x4000), fallback to buffered on Windows/macOS/BSD
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        try:
+            flags |= os.O_DIRECT  # type: ignore  # Linux only
+            fd = os.open(str(path), flags, 0o644)
+            self._segment_file = os.fdopen(fd, "ab", buffering=0)  # unbuffered for O_DIRECT
+            logger.debug("WAL opened with O_DIRECT")
+        except Exception as e:
+            logger.debug(f"WAL O_DIRECT not available, using buffered: {e}")
+            self._segment_file = open(path, "ab")
         self._segment_written = 0 if not path.exists() else path.stat().st_size
+        # S3 replication hook (async best-effort) — set VSECTOR_S3_BUCKET to enable
+        self._s3_replicate(path)
 
     def _rotate_if_needed(self, entry_size: int):
         if self._segment_written + entry_size > self.segment_bytes:
@@ -121,6 +132,21 @@ class WAL:
                     continue
                 entries.append(WALEntry(payload=payload, timestamp=ts))
         return entries
+
+    def _s3_replicate(self, path: Path):
+        """Best-effort S3 replication of closed segments — no-op if bucket not set."""
+        try:
+            import os
+
+            if os.getenv("VSECTOR_S3_BUCKET"):
+                from .s3 import S3Tier
+
+                tier = S3Tier()
+                if tier.enabled:
+                    # replicate in background thread to not block WAL
+                    threading.Thread(target=tier.upload, args=(path,), daemon=True).start()
+        except Exception:
+            pass
 
     def gc(self):
         """Retention 7 days."""

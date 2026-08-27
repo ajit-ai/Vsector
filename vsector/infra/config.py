@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     # Etcd (abstracted - can be in-memory for single-node)
     etcd_endpoints: str = "localhost:2379"
 
+    # Postgres
+    database_url: str = ""  # VSECTOR_DATABASE_URL
+
+    # S3
+    s3_endpoint_url: str = ""  # for MinIO
+
     # Observability
     otel_endpoint: str = ""
     log_level: str = "INFO"

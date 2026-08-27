@@ -10,32 +10,9 @@ from .hash_ring import RendezvousHash
 from .shard import Shard
 
 # Abstract etcd - in-memory for single-node; pluggable for distributed
-class EtcdStore:
-    """Minimal etcd abstraction. Thread-safe dict."""
-
-    def __init__(self):
-        self._data: Dict[str, Shard] = {}
-        self._lock = threading.RLock()
-
-    def put(self, shard: Shard) -> None:
-        with self._lock:
-            self._data[shard.id] = shard
-
-    def get(self, shard_id: str) -> Shard | None:
-        with self._lock:
-            return self._data.get(shard_id)
-
-    def list_by_namespace(self, namespace: str) -> List[Shard]:
-        with self._lock:
-            return [s for s in self._data.values() if s.namespace == namespace]
-
-    def delete(self, shard_id: str) -> None:
-        with self._lock:
-            self._data.pop(shard_id, None)
-
-    def all(self) -> List[Shard]:
-        with self._lock:
-            return list(self._data.values())
+# Real implementation moved to vsector.sharding.etcd (Etcd3Store + make_etcd_store)
+from .etcd import EtcdStore  # re-export for backward compat
+# (InMemoryEtcd alias)
 
 
 class ShardRouter:
