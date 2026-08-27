@@ -130,10 +130,22 @@ class QueryEngine:
 
         # Merge global top-K
         all_cands.sort(key=lambda x: x["score"], reverse=True)
-        top = all_cands[:top_k]
+        top = all_cands[: max(top_k * 3, top_k)]  # over-fetch for re-rank
 
-        # optional re-ranking: cross-encoder/MMR placeholder (simple score boost for recency)
-        # here we keep sorted order
+        # Re-ranking: cross-encoder (if VSECTOR_RERANK=cross_encoder) + MMR (if VSECTOR_RERANK=mmr)
+        import os
+
+        rerank = os.getenv("VSECTOR_RERANK", "").lower()
+        if rerank in ("cross_encoder", "cross-encoder", "ce"):
+            from .ranking import cross_encoder_rerank
+
+            top = cross_encoder_rerank(query_vec, top, top_k=top_k)
+        elif rerank == "mmr":
+            from .ranking import mmr_rerank
+
+            top = mmr_rerank(query_vec, top, top_k=top_k, lambda_mult=float(os.getenv("VSECTOR_MMR_LAMBDA", "0.5")))
+        else:
+            top = top[:top_k]
 
         took_ms = int((time.time() - t0) * 1000)
         QUERY_COUNTER.labels(namespace=namespace).inc()
