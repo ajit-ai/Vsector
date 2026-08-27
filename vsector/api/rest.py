@@ -76,7 +76,11 @@ async def create_namespace(body: NamespaceCreate, _auth=Depends(verify_api_key))
             replication_factor=body.replication_factor,
             shard_count=body.shard_count,
             compression=CompressionType(body.compression),
+            expected_records=body.expected_records,
         )
+        # cost-based auto-tuning if expected_records supplied
+        if body.expected_records:
+            ns.auto_tune(shard_max_vectors=settings.shard_max_vectors)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     try:
@@ -109,7 +113,14 @@ async def namespace_stats(name: str):
         raise HTTPException(status_code=404, detail="not found")
     shards = router.etcd.list_by_namespace(name)
     total = sum(s.vector_count for s in shards)
-    return {"namespace": name, "dimension": ns.dimension, "index_type": ns.index_type.value, "shard_count": len(shards), "total_vectors": total, "replication_factor": ns.replication_factor, "shards": [s.to_dict() for s in shards]}
+    # cost estimate
+    try:
+        from ..models.cost import estimate_cost
+
+        cost = estimate_cost(ns.expected_records or total or 1000000, ns.dimension, ns.compression.value, ns.replication_factor)
+    except Exception:
+        cost = {}
+    return {"namespace": name, "dimension": ns.dimension, "index_type": ns.index_type.value, "shard_count": len(shards), "total_vectors": total, "replication_factor": ns.replication_factor, "cost": cost, "shards": [s.to_dict() for s in shards]}
 
 @app.get(f"{settings.api_prefix}/namespaces", tags=["namespaces"])
 async def list_namespaces():
