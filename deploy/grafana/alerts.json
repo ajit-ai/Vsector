@@ -1,0 +1,5 @@
+{
+  "groups": [
+    { "title": "Vsector SLO", "alerts": ["VsectorP99LatencyHigh", "VsectorIngestHighErrors"] }
+  ]
+}
