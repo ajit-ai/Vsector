@@ -1,0 +1,7 @@
+apiVersion: v2
+name: vsector
+description: Trillion-Scale Vector DB Helm chart
+type: application
+version: 0.2.0
+appVersion: 0.2.0
+keywords: [vector-db, ann, hnsw, ivf-pq]

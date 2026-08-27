@@ -1,0 +1,23 @@
+{{- include "vsector.labels" . | nindent 0 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: {{ .Release.Name }}, labels: {{ include "vsector.labels" . | nindent 4 }} }
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector: { matchLabels: {{ include "vsector.selectorLabels" . | nindent 6 }} }
+  template:
+    metadata: { labels: {{ include "vsector.selectorLabels" . | nindent 8 }} }
+    spec:
+      containers:
+        - name: vsector
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports: [{ containerPort: 8080, name: http }, { containerPort: 50051, name: grpc }]
+          env:
+            {{- range $k, $v := .Values.env }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          livenessProbe: { httpGet: { path: /health, port: 8080 }, initialDelaySeconds: 10 }
+          readinessProbe: { httpGet: { path: /ready, port: 8080 }, initialDelaySeconds: 5 }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: {{ .Release.Name }}-pvc } }]

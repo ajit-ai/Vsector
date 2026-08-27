@@ -1,0 +1,33 @@
+replicaCount: 3
+image:
+  repository: vsector
+  tag: 0.2.0
+  pullPolicy: IfNotPresent
+service:
+  type: LoadBalancer
+  httpPort: 80
+  targetPort: 8080
+  grpcPort: 50051
+env:
+  VSECTOR_ENV: production
+  VSECTOR_DATABASE_URL: "postgresql://vsector:changeme@postgres:5432/vsector"
+  VSECTOR_ETCD_ENDPOINTS: "etcd:2379"
+  VSECTOR_S3_BUCKET: ""
+  VSECTOR_S3_PREFIX: "vsector/"
+resources:
+  requests: { cpu: "2", memory: "4Gi" }
+  limits: { cpu: "4", memory: "8Gi" }
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  cpu: 70
+persistence:
+  enabled: true
+  size: 100Gi
+postgres:
+  enabled: true
+etcd:
+  enabled: true
+kafka:
+  enabled: true
