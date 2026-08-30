@@ -1,0 +1,125 @@
+{
+  "results": [
+    {
+      "index": "HNSW",
+      "n": 2000,
+      "dim": 32,
+      "ingest_ms": 1,
+      "p50_ms": 0.16,
+      "p99_ms": 0.37,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0,
+        "gpu_enabled": false,
+        "competitors": {
+          "vsector_sq8": 0.0,
+          "pinecone_p1": 70.0,
+          "qdrant_cloud": 25.0,
+          "milvus_zilliz": 30.0
+        }
+      },
+      "pass": true
+    },
+    {
+      "index": "HNSW",
+      "n": 2000,
+      "dim": 32,
+      "ingest_ms": 0,
+      "p50_ms": 0.18,
+      "p99_ms": 0.63,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0,
+        "gpu_enabled": false,
+        "competitors": {
+          "vsector_sq8": 0.0,
+          "pinecone_p1": 70.0,
+          "qdrant_cloud": 25.0,
+          "milvus_zilliz": 30.0
+        }
+      },
+      "pass": true
+    },
+    {
+      "index": "IVF_PQ",
+      "n": 2000,
+      "dim": 32,
+      "ingest_ms": 0,
+      "p50_ms": 0.17,
+      "p99_ms": 0.63,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0,
+        "gpu_enabled": false,
+        "competitors": {
+          "vsector_sq8": 0.0,
+          "pinecone_p1": 70.0,
+          "qdrant_cloud": 25.0,
+          "milvus_zilliz": 30.0
+        }
+      },
+      "pass": true
+    },
+    {
+      "index": "SCANN",
+      "n": 2000,
+      "dim": 32,
+      "ingest_ms": 34,
+      "p50_ms": 0.23,
+      "p99_ms": 3.81,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 32,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0,
+        "gpu_enabled": false,
+        "competitors": {
+          "vsector_sq8": 0.0,
+          "pinecone_p1": 70.0,
+          "qdrant_cloud": 25.0,
+          "milvus_zilliz": 30.0
+        }
+      },
+      "pass": true
+    },
+    {
+      "index": "FLAT",
+      "n": 2000,
+      "dim": 32,
+      "ingest_ms": 0,
+      "p50_ms": 0.17,
+      "p99_ms": 0.39,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0,
+        "gpu_enabled": false,
+        "competitors": {
+          "vsector_sq8": 0.0,
+          "pinecone_p1": 70.0,
+          "qdrant_cloud": 25.0,
+          "milvus_zilliz": 30.0
+        }
+      },
+      "pass": true
+    }
+  ],
+  "markdown": "| Index (Vsector) | Mimics | P50 | P99 | Recall | $/mo (1M 1536d SQ8) |\n|---|---|---|---|---|---|\n| HNSW | Qdrant | 0.16 | 0.37 | 1.0 | $0.0 |\n| HNSW | Qdrant | 0.18 | 0.63 | 1.0 | $0.0 |\n| IVF_PQ | Milvus | 0.17 | 0.63 | 1.0 | $0.0 |\n| SCANN | Google ScaNN | 0.23 | 3.81 | 1.0 | $0.0 |\n| FLAT | pgvector | 0.17 | 0.39 | 1.0 | $0.0 |"
+}

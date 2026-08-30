@@ -50,12 +50,23 @@ def estimate_cost(
     replication_factor: int = 3,
     storage_gb_per_usd: float = 100,  # $1 per 100GB NVMe
     ram_gb_per_usd: float = 20,  # $1 per 20GB RAM (HNSW)
+    gpu_enabled: bool = False,
 ) -> dict:
     bpv = bytes_per_vector(dimension, compression)
     total_bytes = expected_records * bpv * replication_factor
     gb = total_bytes / (1024**3)
-    # Simplified: 30% RAM (HNSW), 70% NVMe
+    # Simplified: 30% RAM (HNSW), 70% NVMe; GPU adds 0.5× RAM cost if enabled
     ram_gb = gb * 0.3
     nvme_gb = gb * 0.7
     cost = ram_gb / ram_gb_per_usd + nvme_gb / storage_gb_per_usd
-    return {"bytes_per_vector": bpv, "total_gb": round(gb, 2), "ram_gb": round(ram_gb, 2), "nvme_gb": round(nvme_gb, 2), "est_usd_month": round(cost, 2)}
+    if gpu_enabled:
+        # A100-like: $2/hr ~ $1440/mo, amortized per GB
+        cost += gb * 0.5
+    # competitor comparison stub (per 1M 1536d SQ8)
+    competitors = {
+        "vsector_sq8": round(cost, 2),
+        "pinecone_p1": round(gb * 0.7 + 70, 2),  # $70 starter
+        "qdrant_cloud": round(gb * 0.4 + 25, 2),
+        "milvus_zilliz": round(gb * 0.35 + 30, 2),
+    }
+    return {"bytes_per_vector": bpv, "total_gb": round(gb, 2), "ram_gb": round(ram_gb, 2), "nvme_gb": round(nvme_gb, 2), "est_usd_month": round(cost, 2), "gpu_enabled": gpu_enabled, "competitors": competitors}
