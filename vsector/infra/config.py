@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     rerank: str = ""  # cross_encoder | mmr
     mmr_lambda: float = 0.5
 
+    # Cache / CDN
+    redis_url: str = ""  # VSECTOR_REDIS_URL
+    cache_ttl_s: int = 60
+    cdn_url: str = ""  # VSECTOR_CDN_URL (CloudFront / CDN)
+
     # Observability
     otel_endpoint: str = ""
     log_level: str = "INFO"
