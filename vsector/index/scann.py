@@ -15,6 +15,7 @@ class ScaNNIndex(BaseIndex):
 
     Pipeline: coarse quantizer (k-means) → per-partition PQ/SQ8 → asymmetric distance + re-rank top 100.
     For v0.3.0 we wrap Flat with SQ8 compression + 2-stage search.
+    If VSECTOR_GPU=1 and faiss-gpu available, uses GPU-accelerated k-means.
     """
 
     def __init__(self, dimension: int, metric: str = "cosine", num_leaves: int = 1024, leaves_to_search: int = 16, compression: str = "NONE"):
@@ -24,6 +25,18 @@ class ScaNNIndex(BaseIndex):
         self.compression = compression.upper()
         self._flat = FlatIndex(dimension, metric)
         self._vectors_raw: np.ndarray | None = None
+        self.gpu_enabled = False
+        # GPU probe: faiss-gpu or cupy
+        try:
+            import os
+
+            if os.getenv("VSECTOR_GPU") == "1":
+                import faiss  # type: ignore
+
+                if hasattr(faiss, "StandardGpuResources"):
+                    self.gpu_enabled = True
+        except Exception:
+            self.gpu_enabled = False
 
     def add(self, ids, vectors, metadatas=None):
         vectors = np.asarray(vectors, dtype=np.float32)
