@@ -1,0 +1,6 @@
+{
+  "policies": {
+    "demo": { "products": ["reader", "writer"], "*": ["reader"] },
+    "test": { "*": ["admin"] }
+  }
+}
