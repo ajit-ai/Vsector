@@ -1,0 +1,90 @@
+{
+  "results": [
+    {
+      "index": "HNSW",
+      "n": 5000,
+      "dim": 32,
+      "ingest_ms": 3,
+      "p50_ms": 0.57,
+      "p99_ms": 1.06,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0
+      },
+      "pass": true
+    },
+    {
+      "index": "HNSW",
+      "n": 5000,
+      "dim": 32,
+      "ingest_ms": 11,
+      "p50_ms": 0.33,
+      "p99_ms": 0.99,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0
+      },
+      "pass": true
+    },
+    {
+      "index": "IVF_PQ",
+      "n": 5000,
+      "dim": 32,
+      "ingest_ms": 1,
+      "p50_ms": 0.32,
+      "p99_ms": 0.67,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0
+      },
+      "pass": true
+    },
+    {
+      "index": "SCANN",
+      "n": 5000,
+      "dim": 32,
+      "ingest_ms": 177,
+      "p50_ms": 0.39,
+      "p99_ms": 0.66,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 32,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0
+      },
+      "pass": true
+    },
+    {
+      "index": "FLAT",
+      "n": 5000,
+      "dim": 32,
+      "ingest_ms": 1,
+      "p50_ms": 0.32,
+      "p99_ms": 1.06,
+      "recall": 1.0,
+      "cost": {
+        "bytes_per_vector": 128,
+        "total_gb": 0.0,
+        "ram_gb": 0.0,
+        "nvme_gb": 0.0,
+        "est_usd_month": 0.0
+      },
+      "pass": true
+    }
+  ],
+  "markdown": "| Index (Vsector) | Mimics | P50 | P99 | Recall | $/mo (1M 1536d SQ8) |\n|---|---|---|---|---|---|\n| HNSW | Qdrant | 0.57 | 1.06 | 1.0 | $0.0 |\n| HNSW | Qdrant | 0.33 | 0.99 | 1.0 | $0.0 |\n| IVF_PQ | Milvus | 0.32 | 0.67 | 1.0 | $0.0 |\n| SCANN | Google ScaNN | 0.39 | 0.66 | 1.0 | $0.0 |\n| FLAT | pgvector | 0.32 | 1.06 | 1.0 | $0.0 |"
+}
