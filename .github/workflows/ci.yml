@@ -80,3 +80,20 @@ jobs:
         run: |
           pip install -e .
           python -c "from vsector.models.cost import auto_shard_count, estimate_cost; print(auto_shard_count(2000000000,1536)); print(estimate_cost(1000000,1536,'SQ8'))"
+
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Run ann-benchmarks + publish
+        run: |
+          pip install -e . && pip install numpy
+          python benchmarks/ann_benchmark.py --n 20000 --dim 64
+          cat benchmarks/report.json
+          python benchmarks/soak.py --loops 50
+          python benchmarks/jepsen.py --ops 100 --concurrency 4
+      - uses: actions/upload-artifact@v4
+        with: { name: benchmark-report, path: benchmarks/report.json }
