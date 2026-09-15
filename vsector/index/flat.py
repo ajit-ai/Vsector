@@ -8,6 +8,9 @@ from .base import BaseIndex, IndexResult
 class FlatIndex(BaseIndex):
     def __init__(self, dimension: int, metric: str = "cosine"):
         super().__init__(dimension, metric)
+        self.backend_name = "FlatIndex"
+        self.is_native_backend = True
+        self.degraded = False
         self.ids: list[str] = []
         self.vectors: np.ndarray | None = None
         self.metadatas: list[dict] = []

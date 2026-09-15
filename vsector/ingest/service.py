@@ -7,6 +7,7 @@ Flow: Client -> API Gateway -> Ingest Service (validate) -> WAL Writer (durable,
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -18,6 +19,7 @@ from ..models.vector_record import VectorRecord
 from ..models.namespace import Namespace
 from ..storage.wal import WAL, WALEntry
 from ..storage.segment import SegmentStore
+from ..storage.recovery import recover
 from ..storage.metadata import MetadataStore
 from ..sharding.router import ShardRouter, EtcdStore
 from ..sharding.shard import Shard
@@ -41,15 +43,15 @@ class ShardContext:
         self.segments = SegmentStore(seg_dir)
         self.index = create_index(namespace.index_type.value, dimension=namespace.dimension, metric=namespace.distance_metric.value)
         self.lifecycle = IndexLifecycleManager(self.index)
+        # Single authoritative recovery path: resolve durable SSTable + WAL state into
+        # the current logical state and rebuild the index from it exactly once.
+        self.recovery = recover(self.wal, self.segments)
+        self.tombstones: set[str] = set(self.recovery.deleted_ids)
+        for rec in self.recovery.records:
+            self.index.add([str(rec.id)], np.array([rec.vector], dtype=np.float32), [rec.metadata])
+            self.lifecycle.notify_write(1)
+            self.shard.vector_count += 1
         self.lifecycle.mark_ready()
-        # hydrate from segments
-        for rec in self.segments.scan_all():
-            try:
-                self.index.add([str(rec.id)], np.array([rec.vector], dtype=np.float32), [rec.metadata])
-                self.lifecycle.notify_write(1)
-                self.shard.vector_count += 1
-            except Exception:
-                pass
 
 
 class IngestService:
@@ -85,6 +87,7 @@ class IngestService:
 
         upserted: list[str] = []
         errors: list[dict] = []
+        touched: dict[str, ShardContext] = {}
 
         for raw in records:
             try:
@@ -106,10 +109,13 @@ class IngestService:
                 # shard routing (HRW)
                 shard = self.router.route(namespace, str(rec.id))
                 ctx = self._get_or_create_ctx(namespace, shard)
-                # WAL durable write (fsync per batch via group commit)
+                # WAL durable write: append to group-commit buffer, batch-flush once per shard below
+                # Legacy-compatible payload: keep raw VectorRecord JSON for upserts so existing
+                # persisted WAL files and the historical parser both work.
                 payload = rec.model_dump_json().encode()
                 ctx.wal.append(WALEntry(payload=payload))
-                ctx.wal.flush()
+                touched[f"{namespace}:{shard.id}"] = ctx
+                ctx.tombstones.discard(str(rec.id))  # re-insert resurrects a previously deleted id
                 # Shard Router -> Primary Shard Node -> MemTable
                 ctx.segments.put(rec)
                 # Replicate to 2 followers (async quorum ack)
@@ -129,8 +135,12 @@ class IngestService:
                 errors.append({"record": raw.get("id"), "error": str(e)})
                 INGEST_COUNTER.labels(namespace=namespace, status="error").inc()
 
+        # Batch WAL fsync: one flush per touched shard for the whole request (group commit)
+        for ctx in touched.values():
+            ctx.wal.flush()
+
         # Background tasks (simulate)
-        for ctx in self._shards.values():
+        for ctx in touched.values():
             if ctx.segments.memtable.should_flush():
                 ctx.segments.flush()
                 ctx.lifecycle.maybe_compact()
@@ -146,6 +156,7 @@ class IngestService:
             raise ValueError("namespace not found")
         deleted = 0
         shards = self.router.route_for_query(namespace)
+        touched: dict[str, ShardContext] = {}
         for shard in shards:
             ctx = self._get_or_create_ctx(namespace, shard)
             if ids:
@@ -156,6 +167,10 @@ class IngestService:
                         ctx.segments.memtable.delete(_id)
                     ctx.index.delete([_id])
                     ctx.lifecycle.notify_delete(1)
+                    ctx.tombstones.add(_id)  # hide any stale SSTable copy during this process lifetime
+                    # durable tombstone so WAL replay does not resurrect the record
+                    ctx.wal.append(WALEntry(payload=json.dumps({"__op": "delete", "id": _id}).encode()))
+                    touched[f"{namespace}:{shard.id}"] = ctx
                     deleted += 1
             elif filter:
                 # naive filter scan
@@ -163,7 +178,13 @@ class IngestService:
                     if self._matches_filter(rec.metadata, filter):
                         ctx.index.delete([str(rec.id)])
                         ctx.segments.memtable.delete(str(rec.id))
+                        ctx.tombstones.add(str(rec.id))
+                        ctx.wal.append(WALEntry(payload=json.dumps({"__op": "delete", "id": str(rec.id)}).encode()))
+                        touched[f"{namespace}:{shard.id}"] = ctx
                         deleted += 1
+        # Batch WAL fsync for tombstones
+        for ctx in touched.values():
+            ctx.wal.flush()
         return {"deleted": deleted}
 
     def _matches_filter(self, md: dict, f: dict) -> bool:
@@ -195,7 +216,7 @@ class IngestService:
             shard = self.router.route(namespace, _id)
             ctx = self._get_or_create_ctx(namespace, shard)
             rec = ctx.segments.get(_id)
-            if rec:
+            if rec and _id not in ctx.tombstones:
                 out.append(rec.to_payload(include_vector=True))
         return out
 
@@ -204,4 +225,15 @@ class IngestService:
         return r[0] if r else None
 
     def stats(self) -> dict:
-        return {k: {"vectors": v.shard.vector_count, "state": v.lifecycle.state.value} for k,v in self._shards.items()}
+        out = {}
+        for k, v in self._shards.items():
+            out[k] = {
+                "vectors": v.shard.vector_count,
+                "state": v.lifecycle.state.value,
+                "backend_name": getattr(v.index, "backend_name", "unknown"),
+                "is_native_backend": getattr(v.index, "is_native_backend", False),
+                "degraded": getattr(v.index, "degraded", False),
+                "recovered_from_wal": v.recovery.recovered_from_wal,
+                "wal_entries_read": v.recovery.wal_entries_read,
+            }
+        return out

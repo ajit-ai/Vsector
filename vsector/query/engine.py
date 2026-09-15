@@ -104,8 +104,8 @@ class QueryEngine:
             ctx = self.ingest._shards.get(key)
             if not ctx:
                 return [], 0
-            # ANN search
-            results = ctx.index.search(query_vec, top_k=top_k, ef_search=ef_search or ns.index_type, nprobe=nprobe, filter_fn=filter_fn if filters else None)
+            # ANN search (ef_search default is a number; passing the IndexType enum would break real hnswlib)
+            results = ctx.index.search(query_vec, top_k=top_k, ef_search=(ef_search if ef_search is not None else 100), nprobe=nprobe, filter_fn=filter_fn if filters else None)
             # post-filter re-check (already)
             # return local top-K
             candidates = len(results)

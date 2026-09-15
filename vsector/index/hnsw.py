@@ -43,10 +43,16 @@ class HNSWIndex(BaseIndex):
             self._index.init_index(max_elements=max_elements, ef_construction=ef_construction, M=M)
             self._index.set_ef(ef_search)
             self._fallback: FlatIndex | None = None
+            self.degraded = False
+            self.backend_name = "HNSW"
+            self.is_native_backend = True
         else:
             logger.warning("hnswlib not installed - using FlatIndex fallback for HNSW")
             self._index = None  # type: ignore
             self._fallback = FlatIndex(dimension, metric)
+            self.degraded = True
+            self.backend_name = "FlatIndex"
+            self.is_native_backend = False
 
     @property
     def max_level(self) -> int:

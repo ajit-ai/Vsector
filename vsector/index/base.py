@@ -20,6 +20,8 @@ class BaseIndex(abc.ABC):
     def __init__(self, dimension: int, metric: str = "cosine"):
         self.dimension = dimension
         self.metric = metric.lower()
+        self.backend_name = "abstract"
+        self.is_native_backend = False
 
     @abc.abstractmethod
     def add(self, ids: list[str], vectors: np.ndarray, metadatas: list[dict] | None = None) -> None: ...

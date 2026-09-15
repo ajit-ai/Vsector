@@ -26,6 +26,9 @@ class ScaNNIndex(BaseIndex):
         self._flat = FlatIndex(dimension, metric)
         self._vectors_raw: np.ndarray | None = None
         self.gpu_enabled = False
+        self.degraded = True  # ScaNN is a simulation wrapper over FlatIndex (no real ScaNN/GPU backend)
+        self.backend_name = "FlatIndex"  # honest: no real ScaNN/GPU backend
+        self.is_native_backend = False
         # GPU probe: faiss-gpu or cupy
         try:
             import os

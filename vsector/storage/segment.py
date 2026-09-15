@@ -152,6 +152,15 @@ class SegmentStore:
                         return r
         return None
 
+    def durable_records_by_id(self) -> Dict[str, VectorRecord]:
+        """Return the latest per-id records durably flushed to SSTables (newest wins)."""
+        latest: Dict[str, VectorRecord] = {}
+        with self._lock:
+            for sst in self._sstables:
+                for r in sst.scan():
+                    latest[str(r.id)] = r
+        return latest
+
     def scan_all(self) -> List[VectorRecord]:
         out = self.memtable.scan()
         with self._lock:

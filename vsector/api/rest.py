@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import uuid
 import asyncio
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Depends, HTTPException, Response, status
@@ -30,6 +31,7 @@ from .schemas import NamespaceCreate, UpsertRequest, QueryRequest, FetchRequest,
 cdn = CDN()
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # singletons for single-node deployment
 metadata_store = MetadataStore(path=f"{settings.data_dir}/metadata.json")
@@ -44,6 +46,26 @@ for _ns in metadata_store.list():
         for i in range(_ns.shard_count):
             _shard = Shard(namespace=_ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
             router.register_shard(_shard)
+
+# Eager startup recovery: create shard contexts so WAL replay + index rebuild run at
+# boot, BEFORE the node is reported ready. Any failure marks recovery as incomplete.
+recovery_status: dict[str, str] = {}
+
+
+def _run_startup_recovery() -> None:
+    for _ns in metadata_store.list():
+        for _shard in router.etcd.list_by_namespace(_ns.name):
+            key = f"{_ns.name}:{_shard.id}"
+            try:
+                _ctx = ingest._get_or_create_ctx(_ns.name, _shard)
+                recovered = _ctx.recovery.recovered_from_wal
+                if recovered:
+                    recovery_status[key] = f"recovered:{recovered}"
+            except Exception as e:  # surfaced via /ready and logs, not silently swallowed
+                logger.error(f"startup recovery failed for {key}: {e}")
+                recovery_status[key] = f"error:{e}"
+
+_run_startup_recovery()
 
 app = FastAPI(
     title="Vsector Vector Database",
@@ -61,7 +83,10 @@ async def health():
 
 @app.get("/ready", tags=["ops"])
 async def ready():
-    return {"ready": True, "namespaces": len(metadata_store.list())}
+    recovery_ok = not any(v.startswith("error:") for v in recovery_status.values())
+    return {"ready": recovery_ok,
+            "namespaces": len(metadata_store.list()),
+            "recovery": recovery_status or "complete"}
 
 @app.get("/metrics", tags=["ops"])
 async def metrics():
