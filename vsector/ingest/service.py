@@ -26,7 +26,7 @@ from ..sharding.shard import Shard
 from ..sharding.replication import InProcessReplicaTransport, ReplicaEndpoint, aggregate_replication
 from ..index.factory import create_index
 from ..index.lifecycle import IndexLifecycleManager
-from ..infra.metrics import INGEST_COUNTER, REPLICATION_ATTEMPTS, REPLICATION_ACKS, REPLICATION_FAILURES, REPLICATION_DEGRADED
+from ..infra.metrics import INGEST_COUNTER, REPLICATION_ATTEMPTS, REPLICATION_ACKS, REPLICATION_FAILURES, REPLICATION_DEGRADED, REPLICATION_HEALTHY_REPLICAS, REPLICATION_READY
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,16 @@ class IngestService:
             REPLICATION_FAILURES.labels(namespace=namespace, replica_id=node_id).inc()
         if repl.degraded:
             REPLICATION_DEGRADED.labels(namespace=namespace).inc()
+
+    def _replication_health_map(self, namespace: str, ns: Namespace, touched: dict[str, ShardContext]) -> dict:
+        """Additive per-shard health snapshot for a write request (single shard -> object)."""
+        health_map: dict[str, dict] = {}
+        for ctx in touched.values():
+            key = f"{ctx.shard.namespace}:{ctx.shard.id}"
+            health_map[key] = self.replicator.replication_health(namespace, ctx.shard, ns.required_acks).to_dict()
+        if len(health_map) == 1:
+            return list(health_map.values())[0]
+        return {"shards": health_map}
 
     def _get_or_create_ctx(self, namespace: str, shard: Shard) -> ShardContext:
         key = f"{namespace}:{shard.id}"
@@ -189,6 +199,7 @@ class IngestService:
         repl_summary = aggregate_replication(replication_results, ns.required_acks)
         if errors:
             repl_summary["success"] = False
+        repl_summary["health"] = self._replication_health_map(namespace, ns, touched)
         result["replication"] = repl_summary
         if idempotency_key:
             self._idempotency[idempotency_key] = result
@@ -239,7 +250,9 @@ class IngestService:
         # Batch WAL fsync for tombstones
         for ctx in touched.values():
             ctx.wal.flush()
-        return {"deleted": deleted, "replication": aggregate_replication(replication_results, ns.required_acks)}
+        repl_summary = aggregate_replication(replication_results, ns.required_acks)
+        repl_summary["health"] = self._replication_health_map(namespace, ns, touched)
+        return {"deleted": deleted, "replication": repl_summary}
 
     def _matches_filter(self, md: dict, f: dict) -> bool:
         for k, cond in f.items():
@@ -281,6 +294,10 @@ class IngestService:
     def stats(self) -> dict:
         out = {}
         for k, v in self._shards.items():
+            ns = v.shard.namespace
+            health = self.replicator.replication_health(ns, v.shard, v.namespace.required_acks)
+            REPLICATION_HEALTHY_REPLICAS.labels(namespace=ns, shard_id=v.shard.id).set(health.healthy_replicas)
+            REPLICATION_READY.labels(namespace=ns, shard_id=v.shard.id).set(1 if health.ready else 0)
             out[k] = {
                 "vectors": v.shard.vector_count,
                 "state": v.lifecycle.state.value,
@@ -290,5 +307,6 @@ class IngestService:
                 "recovered_from_wal": v.recovery.recovered_from_wal,
                 "wal_entries_read": v.recovery.wal_entries_read,
                 "replication": self._replication_stats.get(k, {"attempts": 0, "acks": 0, "failures": 0, "degraded": 0}),
+                "replication_health": health.to_dict(),
             }
         return out

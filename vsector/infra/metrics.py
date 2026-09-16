@@ -11,3 +11,5 @@ REPLICATION_ATTEMPTS = Counter("vsector_replication_attempts_total", "Replicatio
 REPLICATION_ACKS = Counter("vsector_replication_acks_total", "Replica acknowledgements", ["namespace"])
 REPLICATION_FAILURES = Counter("vsector_replication_failures_total", "Replica failures", ["namespace", "replica_id"])
 REPLICATION_DEGRADED = Counter("vsector_replication_degraded_total", "Degraded writes", ["namespace"])
+REPLICATION_HEALTHY_REPLICAS = Gauge("vsector_replication_healthy_replicas", "Healthy replicas per shard", ["namespace", "shard_id"])
+REPLICATION_READY = Gauge("vsector_replication_ready", "Replication-ready shard (ack policy satisfiable)", ["namespace", "shard_id"])

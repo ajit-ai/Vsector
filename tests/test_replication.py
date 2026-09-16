@@ -354,4 +354,220 @@ async def test_stats_expose_replication_counts(tmp_path):
     assert rep["attempts"] >= 1
     assert rep["failures"] >= 1
     assert rep["degraded"] >= 1
+    # VS-09.3: health view is additive in stats and matches the degraded transport state
+    health = stats[key]["replication_health"]
+    assert health["ready"] is True and health["degraded"] is True
+    assert health["configured_replicas"] == 1 and health["healthy_replicas"] == 0
     _shutdown_all(ingest)
+
+
+# ===========================================================================
+# VS-09.3: replication health & readiness
+# ===========================================================================
+
+
+# --- Test 1: all replicas healthy ------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_all_replicas_healthy(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_ok", required_acks=2, replicas=("rep-a",))
+    res = await ingest.upsert("ns_health_ok", [{"id": _uid(100), "vector": _vec(100)}])
+    assert res["replication"]["success"] is True
+
+    health = ingest.replicator.replication_health("ns_health_ok", shard, required_acks=2)
+    assert health.ready is True
+    assert health.degraded is False
+    assert health.healthy_replicas == health.configured_replicas == 1
+    assert health.required_acks == 2
+    assert health.replicas[0].healthy is True
+    assert health.replicas[0].available is True
+    assert health.replicas[0].last_error is None
+    assert health.last_failure is None
+
+    # response embeds the additive health snapshot
+    rh = res["replication"]["health"]
+    assert rh["ready"] is True
+    assert rh["degraded"] is False
+    assert rh["healthy_replicas"] == 1
+    _shutdown_all(ingest)
+
+
+# --- Test 2: optional replica failure --------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_optional_replica_failure(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_opt", required_acks=1, replicas=("rep-a",))
+    ingest.replicator.fail_node("rep-a")
+    res = await ingest.upsert("ns_health_opt", [{"id": _uid(101), "vector": _vec(101)}])
+    assert res["replication"]["success"] is True    # primary-only ack suffices
+    assert res["replication"]["degraded"] is True
+
+    health = ingest.replicator.replication_health("ns_health_opt", shard, required_acks=1)
+    assert health.ready is True                     # degraded != not-ready
+    assert health.degraded is True
+    assert health.healthy_replicas == 0
+    assert health.replicas[0].healthy is False
+    assert health.replicas[0].available is False
+    assert "replica unavailable" in (health.replicas[0].last_error or "")
+    assert health.last_failure is not None
+
+    # the primary remains usable
+    assert len(await ingest.fetch("ns_health_opt", [_uid(101)])) == 1
+    rh = res["replication"]["health"]
+    assert rh["ready"] is True and rh["degraded"] is True
+    _shutdown_all(ingest)
+
+
+# --- Test 3: required replica failure ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_required_replica_failure(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_req", required_acks=2, replicas=("rep-a",))
+    ingest.replicator.fail_node("rep-a")
+    res = await ingest.upsert("ns_health_req", [{"id": _uid(102), "vector": _vec(102)}])
+    assert res["replication"]["success"] is False
+
+    health = ingest.replicator.replication_health("ns_health_req", shard, required_acks=2)
+    assert health.ready is False
+    assert health.degraded is True
+    assert health.healthy_replicas == 0
+    _shutdown_all(ingest)
+
+
+# --- Test 4: recovery of a failed replica -----------------------------------
+
+@pytest.mark.asyncio
+async def test_health_recovers_after_failure(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_rec", required_acks=2, replicas=("rep-a",))
+    ingest.replicator.fail_node("rep-a")
+    await ingest.upsert("ns_health_rec", [{"id": _uid(103), "vector": _vec(103)}])
+    assert ingest.replicator.replication_health("ns_health_rec", shard, required_acks=2).ready is False
+
+    # healing alone is not a fake recovery: no subsequent success yet
+    ingest.replicator.heal_node("rep-a")
+    stale = ingest.replicator.replication_health("ns_health_rec", shard, required_acks=2)
+    assert stale.ready is False
+    assert stale.replicas[0].healthy is False
+
+    # a real successful delivery restores health
+    res = await ingest.upsert("ns_health_rec", [{"id": _uid(104), "vector": _vec(104)}])
+    assert res["replication"]["success"] is True
+    fine = ingest.replicator.replication_health("ns_health_rec", shard, required_acks=2)
+    assert fine.ready is True
+    assert fine.degraded is False
+    assert fine.replicas[0].healthy is True
+    assert fine.replicas[0].available is True
+    assert fine.replicas[0].last_error is None
+    _shutdown_all(ingest)
+
+
+# --- Test 5: multiple replicas -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_multiple_replicas(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_multi", required_acks=1, replicas=("rep-a", "rep-b"))
+    await ingest.upsert("ns_health_multi", [{"id": _uid(105), "vector": _vec(105)}])
+    h = ingest.replicator.replication_health("ns_health_multi", shard, required_acks=1)
+    assert h.ready is True and h.degraded is False
+    assert h.healthy_replicas == h.configured_replicas == 2
+
+    # one failed
+    ingest.replicator.fail_node("rep-a")
+    await ingest.upsert("ns_health_multi", [{"id": _uid(106), "vector": _vec(106)}])
+    h1 = ingest.replicator.replication_health("ns_health_multi", shard, required_acks=1)
+    assert h1.ready is True and h1.degraded is True
+    assert h1.healthy_replicas == 1
+
+    # both failed with the stricter policy -> not ready (1 primary + 0 healthy < 2)
+    ingest.replicator.fail_node("rep-b")
+    await ingest.upsert("ns_health_multi", [{"id": _uid(107), "vector": _vec(107)}])
+    h2 = ingest.replicator.replication_health("ns_health_multi", shard, required_acks=2)
+    assert h2.ready is False and h2.degraded is True
+    assert h2.healthy_replicas == 0
+    # same underlying state, relaxed policy -> degraded but ready again
+    h3 = ingest.replicator.replication_health("ns_health_multi", shard, required_acks=1)
+    assert h3.ready is True and h3.degraded is True
+    _shutdown_all(ingest)
+
+
+# --- Test 6: primary failure ------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_primary_failure_no_fake_replica_status(tmp_path, monkeypatch):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_primary", required_acks=2, replicas=("rep-a",))
+    rid = _uid(108)
+    pctx = ingest._get_or_create_ctx("ns_health_primary", shard)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("primary local apply failed")
+
+    monkeypatch.setattr(pctx.segments, "put", _boom)
+    res = await ingest.upsert("ns_health_primary", [{"id": rid, "vector": _vec(108)}])
+    assert res["replication"]["attempted"] == 0
+    assert res["replication"]["success"] is False
+
+    # replication was never attempted -> replicas are NOT falsely marked failed
+    h = ingest.replicator.replication_health("ns_health_primary", shard, required_acks=2)
+    assert h.replicas[0].healthy is True
+    assert h.replicas[0].available is True
+    assert h.replicas[0].last_error is None
+    assert h.degraded is False
+    _shutdown_all(ingest)
+
+
+# --- Test 7: health inspection is non-mutating ------------------------------
+
+@pytest.mark.asyncio
+async def test_health_inspection_is_non_mutating(tmp_path):
+    base = str(tmp_path)
+    ingest, _, shard = _env(base, "ns_health_read", required_acks=1, replicas=("rep-a",))
+    rid = _uid(109)
+    await ingest.upsert("ns_health_read", [{"id": rid, "vector": _vec(109)}])
+    ep = _replica_ep(ingest, "ns_health_read", shard, "rep-a")
+
+    before_entries = [(str(e.payload), e.timestamp) for e in ep.ctx.wal.read_all()]
+    before_segments = ep.ctx.segments.count()
+    before_index = ep.ctx.index.count()
+    before_endpoints = dict(ingest._replica_endpoints)
+
+    h1 = ingest.replicator.replication_health("ns_health_read", shard, required_acks=1).to_dict()
+    h2 = ingest.replicator.replication_health("ns_health_read", shard, required_acks=1).to_dict()
+
+    after_entries = [(str(e.payload), e.timestamp) for e in ep.ctx.wal.read_all()]
+    assert h1 == h2                              # deterministic and idempotent
+    assert after_entries == before_entries       # WAL contents unchanged
+    assert ep.ctx.segments.count() == before_segments
+    assert ep.ctx.index.count() == before_index
+    assert dict(ingest._replica_endpoints) == before_endpoints  # no endpoints created
+    _shutdown_all(ingest)
+
+
+# --- Test 8: health consistent after replica restart/recovery ---------------
+
+@pytest.mark.asyncio
+async def test_health_after_replica_restart(tmp_path):
+    base = str(tmp_path)
+    ns_name = "ns_health_restart"
+    rid = _uid(110)
+
+    ingest1, _, shard1 = _env(base, ns_name, required_acks=1, replicas=("rep-a",))
+    await ingest1.upsert(ns_name, [{"id": rid, "vector": _vec(110)}])
+    assert ingest1.replicator.replication_health(ns_name, shard1, required_acks=1).ready is True
+    _shutdown_all(ingest1)
+
+    # fresh process over the same durable replica directory
+    ingest2, _, shard2 = _env(base, ns_name, required_acks=1, replicas=("rep-a",))
+    ep2 = _replica_ep(ingest2, ns_name, shard2, "rep-a")
+    assert ep2.contains(rid)                     # VS-09.1 recovery re-established the record
+    health = ingest2.replicator.replication_health(ns_name, shard2, required_acks=1)
+    assert health.ready is True
+    assert health.degraded is False
+    assert health.healthy_replicas == 1
+    assert health.replicas[0].last_error is None
+    _shutdown_all(ingest2)

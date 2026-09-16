@@ -1,9 +1,12 @@
-"""VS-09.2: real replication abstraction with failure semantics.
+"""VS-09.2 / VS-09.3: real replication abstraction with failure semantics and health.
 
-Replaces the simulated ``time.sleep(0.001); return True`` acknowledgement with a
-genuine application path: every replicated operation is applied to an
+VS-09.2 replaces the simulated ``time.sleep(0.001); return True`` acknowledgement
+with a genuine application path: every replicated operation is applied to an
 independently represented replica state and the acknowledgement reflects the
 actual result.
+
+VS-09.3 adds a deterministic current health/readiness view derived from the same
+transport state - never fake, never a synthetic probe write.
 
 Model:
 
@@ -11,6 +14,7 @@ Model:
         -> transport -> replica endpoint (independent state) -> ack
         -> result: attempted / acknowledged / failed / required_acks
         -> success / degraded decision
+        -> health: healthy / available / ready snapshot
 
 Acknowledgement policy: ``required_acks`` is the TOTAL number of durably-confirmed
 writes the operation needs, where the primary's own durable write counts as 1.
@@ -19,12 +23,19 @@ replica failure then surfaces as ``degraded`` success.  When ``required_acks``
 exceeds the number of satisfied acknowledgements the operation must report
 failure - never fake success.
 
+Readiness: a shard is ``ready`` when the primary is available AND enough healthy
+replicas can currently satisfy ``required_acks`` (``1 + healthy_replicas >= R``).
+``degraded`` means at least one configured replica is unhealthy/unavailable; it is
+independent of ``ready`` (``required_acks = 1`` with unavailable replicas is a
+degraded-but-ready shard).
+
 No Raft / Paxos / leader election / gossip is introduced.
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -58,6 +69,60 @@ class ReplicationResult:
             "required_acks": self.required_acks,
             "success": self.success,
             "degraded": self.degraded,
+        }
+
+
+@dataclass
+class ReplicaHealth:
+    """Current transport-known health of one replica (per namespace/shard/node)."""
+
+    replica_id: str
+    healthy: bool = True          # no currently known replication failure
+    available: bool = True        # can currently participate (not faulted)
+    last_error: str | None = None
+    last_success: float | None = None  # monotonic ts of last confirmed ack
+    successes: int = 0
+    failures: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "replica_id": self.replica_id,
+            "healthy": self.healthy,
+            "available": self.available,
+            "last_error": self.last_error,
+            "last_success": self.last_success,
+            "successes": self.successes,
+            "failures": self.failures,
+        }
+
+
+@dataclass
+class ReplicationHealth:
+    """Current health/readiness view for one shard, derived from real transport state."""
+
+    primary: str
+    configured_replicas: int
+    healthy_replicas: int
+    available_replicas: int
+    required_acks: int
+    ready: bool
+    degraded: bool
+    replicas: list[ReplicaHealth] = field(default_factory=list)
+    last_success: float | None = None
+    last_failure: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "primary": self.primary,
+            "configured_replicas": self.configured_replicas,
+            "healthy_replicas": self.healthy_replicas,
+            "available_replicas": self.available_replicas,
+            "required_acks": self.required_acks,
+            "ready": self.ready,
+            "degraded": self.degraded,
+            "last_success": self.last_success,
+            "last_failure": self.last_failure,
+            "replicas": [r.to_dict() for r in self.replicas],
         }
 
 
@@ -171,11 +236,17 @@ class InProcessReplicaTransport:
 
     Exceptions are never converted into success: a failed application is recorded
     in ``failed_replicas``, logged, and reflected in the success/degraded decision.
+
+    Health state is derived from the outcomes of actual deliveries (no synthetic
+    probes, no writes used for health checks).
     """
 
     def __init__(self, endpoint_provider: EndpointProvider):
         self.endpoint_provider = endpoint_provider
         self._faults: set[str] = set()
+        self._health: dict[tuple[str, str, str], ReplicaHealth] = {}
+        self._shard_last_success: dict[tuple[str, str], float] = {}
+        self._shard_last_failure: dict[tuple[str, str], str] = {}
 
     # --- fault injection (tests) -------------------------------------------
     def fail_node(self, node_id: str) -> None:
@@ -194,6 +265,65 @@ class InProcessReplicaTransport:
     def replicate_delete(self, namespace: str, shard, payload: bytes, required_acks: int = 1) -> ReplicationResult:
         return self._deliver(namespace, shard, payload, required_acks, op="delete")
 
+    # --- health tracking ---------------------------------------------------
+    def _record_node(self, namespace: str, shard_id: str, node_id: str, ok: bool, error: str | None = None) -> None:
+        key = (namespace, shard_id, node_id)
+        rec = self._health.get(key)
+        if rec is None:
+            rec = ReplicaHealth(replica_id=node_id, healthy=True, available=not self.is_faulted(node_id))
+        if ok:
+            rec.healthy = True
+            rec.available = True
+            rec.last_error = None
+            rec.last_success = time.time()
+            rec.successes += 1
+        else:
+            rec.healthy = False
+            rec.available = not self.is_faulted(node_id)
+            rec.last_error = error or "unknown"
+            rec.failures += 1
+        self._health[key] = rec
+
+    def replication_health(self, namespace: str, shard, required_acks: int, primary_available: bool = True) -> ReplicationHealth:
+        """Current health/readiness for ``shard``. Pure read: never mutates replica state,
+        never touches the WAL, never creates endpoints, never performs writes.
+        """
+        shard_key = (namespace, shard.id)
+        replicas: list[ReplicaHealth] = []
+        for node_id in list(shard.replicas):
+            rec = self._health.get((namespace, shard.id, node_id))
+            if rec is None:
+                # no known failure yet -> healthy; availability is current fault state
+                rec = ReplicaHealth(replica_id=node_id, healthy=True, available=not self.is_faulted(node_id))
+            else:
+                rec = ReplicaHealth(
+                    replica_id=rec.replica_id,
+                    healthy=rec.healthy,
+                    available=not self.is_faulted(node_id),
+                    last_error=rec.last_error,
+                    last_success=rec.last_success,
+                    successes=rec.successes,
+                    failures=rec.failures,
+                )
+            replicas.append(rec)
+        healthy = sum(1 for r in replicas if r.healthy)
+        degraded = any(not r.healthy or not r.available for r in replicas)
+        # same policy as ReplicationResult: successful acks = primary(1) + healthy replicas
+        ready = primary_available and (1 + healthy) >= required_acks
+        return ReplicationHealth(
+            primary=shard.node_id or shard.id,
+            configured_replicas=len(replicas),
+            healthy_replicas=healthy,
+            available_replicas=sum(1 for r in replicas if r.available),
+            required_acks=required_acks,
+            ready=ready,
+            degraded=degraded,
+            replicas=replicas,
+            last_success=self._shard_last_success.get(shard_key),
+            last_failure=self._shard_last_failure.get(shard_key),
+        )
+
+    # --- delivery ----------------------------------------------------------
     def _deliver(self, namespace: str, shard, payload: bytes, required_acks: int, op: str) -> ReplicationResult:
         result = ReplicationResult(primary=shard.node_id or shard.id, required_acks=required_acks)
         for node_id in list(shard.replicas):
@@ -206,9 +336,11 @@ class InProcessReplicaTransport:
                     endpoint.apply_upsert(payload)
                 else:
                     endpoint.apply_delete(payload)
+                self._record_node(namespace, shard.id, node_id, ok=True)
                 result.acknowledged_replicas.append(node_id)
             except Exception as e:  # surfaced as a failed replica, never as success
                 logger.warning(f"replication {op} to {node_id} failed: {e}")
+                self._record_node(namespace, shard.id, node_id, ok=False, error=str(e))
                 result.failed_replicas.append(node_id)
                 result.failures[node_id] = str(e)
 
@@ -216,6 +348,12 @@ class InProcessReplicaTransport:
         ack_total = 1 + len(result.acknowledged_replicas)
         result.success = ack_total >= required_acks
         result.degraded = bool(result.failed_replicas)
+
+        shard_key = (namespace, shard.id)
+        if result.acknowledged_replicas:
+            self._shard_last_success[shard_key] = time.time()
+        if result.failures:
+            self._shard_last_failure[shard_key] = ",".join(f"{n}: {e}" for n, e in result.failures.items())
         return result
 
 
