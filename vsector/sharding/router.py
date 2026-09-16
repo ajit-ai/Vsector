@@ -1,4 +1,20 @@
-"""Shard Router: cached in-memory + gossip invalidation + etcd fallback."""
+"""Shard Router: cached in-memory + gossip invalidation + etcd fallback.
+
+VS-10 adds explicit lifecycle/ownership-aware routing:
+
+- ``route`` resolves namespace -> shard -> the current readable primary shard;
+  records always map to the same shard via HRW (identity stays stable across
+  lifecycle changes); a shard that is not readable yields a deterministic error
+  instead of pretending the record exists elsewhere.
+- ``route_write`` additionally enforces the writable lifecycle state (ACTIVE)
+  and primary ownership: writes are refused with a deterministic error when the
+  shard is CREATING/DRAINING/OFFLINE or when the local node is not the primary
+  owner. No write is ever silently forwarded to a non-primary node.
+- ``route_for_query`` fans out only over readable shards (ACTIVE / DRAINING).
+
+HRW membership is the full shard set so record placement is stable; lifecycle
+checks are applied to the selected shard.
+"""
 from __future__ import annotations
 
 import time
@@ -7,12 +23,30 @@ import hashlib
 from typing import Dict, List
 
 from .hash_ring import RendezvousHash
-from .shard import Shard
+from .exceptions import (
+    OwnershipMismatchError,
+    ShardCreatingError,
+    ShardDrainingError,
+    ShardOfflineError,
+)
+from .shard import Shard, ShardState
 
 # Abstract etcd - in-memory for single-node; pluggable for distributed
 # Real implementation moved to vsector.sharding.etcd (Etcd3Store + make_etcd_store)
 from .etcd import EtcdStore  # re-export for backward compat
 # (InMemoryEtcd alias)
+
+
+READABLE_STATES = frozenset({ShardState.ACTIVE, ShardState.DRAINING})
+
+
+def _state_error(shard: Shard) -> ShardCreatingError | ShardDrainingError | ShardOfflineError:
+    """Deterministic per-state error for a non-writable/-readable shard."""
+    if shard.state is ShardState.CREATING:
+        return ShardCreatingError(shard.namespace, shard.id)
+    if shard.state is ShardState.DRAINING:
+        return ShardDrainingError(shard.namespace, shard.id)
+    return ShardOfflineError(shard.namespace, shard.id, state=shard.state.value)
 
 
 class ShardRouter:
@@ -45,11 +79,12 @@ class ShardRouter:
             self._cache.pop(namespace, None)
             self._hrw_cache.pop(namespace, None)
 
-    def route(self, namespace: str, record_id: str) -> Shard:
+    def _select(self, namespace: str, record_id: str) -> Shard:
+        """HRW selection over the full shard set (stable identity per record)."""
         shards = self._get_shards_cached(namespace)
         if not shards:
             raise KeyError(f"no shards for namespace {namespace!r}")
-        active = [s for s in shards if s.id]  # all
+        active = [s for s in shards if s.id]
         # HRW over shard ids
         hrw = self._hrw_cache.get(namespace)
         if hrw is None:
@@ -69,9 +104,46 @@ class ShardRouter:
                 return s
         return active[0]
 
+    def route(self, namespace: str, record_id: str) -> Shard:
+        """Resolve a record to its readable primary shard (does not fake availability)."""
+        shard = self._select(namespace, record_id)
+        if shard.state not in READABLE_STATES:
+            raise _state_error(shard)
+        return shard
+
+    def route_write(self, namespace: str, record_id: str, owner_node_id: str | None = None) -> Shard:
+        """Resolve a write to its primary-owner shard, enforcing lifecycle + ownership.
+
+        Raises a deterministic error when the shard is CREATING / DRAINING /
+        OFFLINE or when this node is not the primary owner. Writes are never
+        silently rerouted to a different shard or forwarded to a replica.
+        """
+        shard = self._select(namespace, record_id)
+        if shard.state is not ShardState.ACTIVE:
+            raise _state_error(shard)
+        owner = shard.require_owner()
+        if owner_node_id is not None and owner != owner_node_id:
+            raise OwnershipMismatchError(namespace, shard.id, owner, owner_node_id)
+        return shard
+
     def route_for_query(self, namespace: str) -> List[Shard]:
-        """Fan-out to all shards for query (or filtered by HRW if needed)."""
-        return self._get_shards_cached(namespace)
+        """Fan-out to readable shards only (ACTIVE / DRAINING)."""
+        return [s for s in self._get_shards_cached(namespace) if s.state in READABLE_STATES]
+
+    def writable(self, namespace: str, owner_node_id: str | None = None) -> List[Shard]:
+        """All ACTIVE, locally-owned shards for a namespace; refuse otherwise."""
+        out: List[Shard] = []
+        shards = self._get_shards_cached(namespace)
+        if not shards:
+            return out
+        for shard in shards:
+            if shard.state is not ShardState.ACTIVE:
+                raise _state_error(shard)
+            owner = shard.require_owner()
+            if owner_node_id is not None and owner != owner_node_id:
+                raise OwnershipMismatchError(namespace, shard.id, owner, owner_node_id)
+            out.append(shard)
+        return out
 
     # --- Shard Split Algorithm (zero-downtime) ---
     def maybe_split(self, shard: Shard, on_split) -> List[Shard] | None:
@@ -91,7 +163,6 @@ class ShardRouter:
             on_split(shard, shard_a, shard_b)
         self.etcd.put(shard_a)
         self.etcd.put(shard_b)
-        shard.state = shard.state  # would be SPLITTING -> RETIRED
         # retire parent after drain
         self.etcd.delete(shard.id)
         self.invalidate(shard.namespace)

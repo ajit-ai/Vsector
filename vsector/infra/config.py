@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     rate_limit_burst: int = 20000
 
     # Sharding
+    node_id: str = "node-0"  # stable local node identity for shard ownership (VSECTOR_NODE_ID)
     virtual_nodes: int = 256
     shard_max_vectors: int = 50_000_000_000  # 50B auto-split threshold
     shard_default_count: int = 8

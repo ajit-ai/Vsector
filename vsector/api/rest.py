@@ -21,6 +21,7 @@ from ..infra.config import get_settings
 from ..storage.metadata import MetadataStore
 from ..sharding.router import ShardRouter, EtcdStore
 from ..sharding.shard import Shard
+from ..sharding.lifecycle import ShardLifecycleManager
 from ..models.namespace import Namespace, DistanceMetric, IndexType, CompressionType
 from ..ingest.service import IngestService
 from ..query.engine import QueryEngine
@@ -35,17 +36,48 @@ logger = logging.getLogger(__name__)
 
 # singletons for single-node deployment
 metadata_store = MetadataStore(path=f"{settings.data_dir}/metadata.json")
-etcd = EtcdStore()
+etcd = EtcdStore(path=f"{settings.data_dir}/shards.json")
 router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s)
-ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir)
+ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir, node_id=settings.node_id)
 query_engine = QueryEngine(metadata=metadata_store, router=router, ingest_service=ingest)
+_lifecycle = ShardLifecycleManager(etcd)
 
-# Hydrate shards from persisted namespaces on startup (fixes metadata.json persistence vs in-memory etcd)
+# Deterministic single-node topology: this node is the primary owner of every shard
+# it hosts; replicas are drawn from the fixed logical node pool (still in-process).
+_NODE_POOL = ("node-0", "node-1", "node-2")
+
+
+def _replica_nodes(node_id: str) -> list[str]:
+    return [n for n in _NODE_POOL if n != node_id]
+
+
+def _make_shard(ns_name: str, index: int) -> Shard:
+    return Shard(
+        id=f"{ns_name}#shard-{index:03d}",
+        namespace=ns_name,
+        node_id=settings.node_id,
+        replicas=_replica_nodes(settings.node_id),
+    )
+
+
+def _ensure_namespace_shards(ns_name: str, shard_count: int) -> None:
+    """Materialize a namespace's shards with a stable identity (CREATING -> ACTIVE).
+
+    Reuses existing durable shards so shard identity, lifecycle state, and primary
+    ownership survive a restart instead of being regenerated with new ids.
+    """
+    if router.etcd.list_by_namespace(ns_name):
+        return
+    for i in range(shard_count):
+        shard = _make_shard(ns_name, i)
+        _lifecycle.create(shard, owner=settings.node_id, replicas=_replica_nodes(settings.node_id))
+        _lifecycle.activate(shard)
+
+
+# Hydrate shards from persisted namespaces on startup (durable shard store +
+# deterministic ids; fixes metadata.json persistence vs in-memory etcd)
 for _ns in metadata_store.list():
-    if not router.etcd.list_by_namespace(_ns.name):
-        for i in range(_ns.shard_count):
-            _shard = Shard(namespace=_ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
-            router.register_shard(_shard)
+    _ensure_namespace_shards(_ns.name, _ns.shard_count)
 
 # Eager startup recovery: create shard contexts so WAL replay + index rebuild run at
 # boot, BEFORE the node is reported ready. Any failure marks recovery as incomplete.
@@ -115,11 +147,8 @@ async def create_namespace(body: NamespaceCreate, _auth=Depends(verify_api_key))
         metadata_store.create(ns)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    # create shards (HRW ring seeds)
-    for i in range(ns.shard_count):
-        shard = Shard(namespace=ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
-        # vary shard count distribution: use consistent hash
-        router.register_shard(shard)
+    # create shards with stable deterministic identity, this node as primary owner
+    _ensure_namespace_shards(ns.name, ns.shard_count)
     return ns.model_dump(mode="json")
 
 @app.delete(f"{settings.api_prefix}/namespaces/{{name}}", tags=["namespaces"])

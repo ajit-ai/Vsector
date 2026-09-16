@@ -23,6 +23,7 @@ from ..storage.recovery import recover
 from ..storage.metadata import MetadataStore
 from ..sharding.router import ShardRouter
 from ..sharding.shard import Shard
+from ..sharding.lifecycle import ShardLifecycleManager
 from ..sharding.replication import InProcessReplicaTransport, ReplicaEndpoint, aggregate_replication
 from ..index.factory import create_index
 from ..index.lifecycle import IndexLifecycleManager
@@ -55,10 +56,16 @@ class ShardContext:
 
 
 class IngestService:
-    def __init__(self, metadata: MetadataStore, router: ShardRouter, base_dir: str = "./data"):
+    def __init__(self, metadata: MetadataStore, router: ShardRouter, base_dir: str = "./data", node_id: str | None = None):
         self.metadata = metadata
         self.router = router
         self.base_dir = base_dir
+        # Local node identity for VS-10 ownership-aware routing. ``None`` means the
+        # service hosts shards as their primary without asserting a fixed identity
+        # (single-process deployment); configure an explicit ``node_id`` so writes are
+        # refused on shards owned by a different node (no fake forwarding).
+        self.node_id = node_id
+        self._lifecycle = ShardLifecycleManager(self.router.etcd)
         # Real replication transport: applies writes to independently represented in-process
         # replica contexts and reports actual success/degraded/failure (VS-09.2).
         self.replicator = InProcessReplicaTransport(self._get_or_create_replica_endpoint)
@@ -152,8 +159,8 @@ class IngestService:
                     tags=raw.get("tags", []),
                     source_system=raw.get("source_system", "unknown"),
                 )
-                # shard routing (HRW)
-                shard = self.router.route(namespace, str(rec.id))
+                # shard routing (HRW): lifecycle- and ownership-aware (VS-10)
+                shard = self.router.route_write(namespace, str(rec.id), self.node_id)
                 ctx = self._get_or_create_ctx(namespace, shard)
                 # WAL durable write: append to group-commit buffer, batch-flush once per shard below
                 # Legacy-compatible payload: keep raw VectorRecord JSON for upserts so existing
@@ -210,7 +217,7 @@ class IngestService:
         if not ns:
             raise ValueError("namespace not found")
         deleted = 0
-        shards = self.router.route_for_query(namespace)
+        shards = self.router.writable(namespace, self.node_id)
         touched: dict[str, ShardContext] = {}
         replication_results = []
         for shard in shards:
@@ -301,6 +308,9 @@ class IngestService:
             out[k] = {
                 "vectors": v.shard.vector_count,
                 "state": v.lifecycle.state.value,
+                "shard_state": v.shard.state.value,
+                "primary_owner": v.shard.node_id,
+                "replicas": list(v.shard.replicas),
                 "backend_name": getattr(v.index, "backend_name", "unknown"),
                 "is_native_backend": getattr(v.index, "is_native_backend", False),
                 "degraded": getattr(v.index, "degraded", False),

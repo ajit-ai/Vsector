@@ -1,27 +1,84 @@
-"""Etcd backends: InMemory + real etcd3 with gossip invalidation."""
+"""Etcd backends: InMemory + real etcd3 with gossip invalidation.
 
+VS-10 adds optional JSON durability to the in-memory backend
+(``InMemoryEtcd(path=...)``): shard identity, lifecycle state, and ownership
+metadata are persisted so they survive a process restart. Shard objects are
+reconstructed from persisted dicts with proper ``ShardState`` coercion (never a
+raw string in a typed field) and never rely on object memory addresses.
+"""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 
-from .shard import Shard
+from .shard import Shard, ShardState
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_VECTORS = 50_000_000_000
+
+
+def _state_from(value, shard_id: str) -> ShardState:
+    if isinstance(value, ShardState):
+        return value
+    try:
+        return ShardState(str(value))
+    except ValueError:
+        logger.warning(f"shard {shard_id}: unknown persisted state {value!r}; defaulting to ACTIVE")
+        return ShardState.ACTIVE
+
+
+def _shard_from_dict(d: dict) -> Shard:
+    return Shard(
+        id=d.get("id"),
+        namespace=d.get("namespace", ""),
+        node_id=d.get("node_id", "") or d.get("primary_owner", ""),
+        state=_state_from(d.get("state", ShardState.ACTIVE.value), d.get("id", "")),
+        vector_count=d.get("vector_count", 0),
+        max_vectors=d.get("max_vectors", _DEFAULT_MAX_VECTORS),
+        replicas=list(d.get("replicas", [])),
+        created_at=d.get("created_at", time.time()),
+        version=d.get("version", 1),
+    )
+
 
 class InMemoryEtcd:
-    """Minimal etcd abstraction — thread-safe dict."""
+    """Minimal etcd abstraction — thread-safe dict, optionally JSON-durable."""
 
-    def __init__(self):
+    def __init__(self, path: str | None = None):
         self._data: dict[str, Shard] = {}
         self._lock = threading.RLock()
+        self.path = path
+        if path and os.path.exists(path):
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
+            for k, v in raw.items():
+                self._data[k] = _shard_from_dict(v)
+        except Exception as e:
+            logger.warning(f"InMemoryEtcd load failed for {self.path}: {e}")
+
+    def _persist(self) -> None:
+        if not self.path:
+            return
+        with self._lock:
+            data = {k: v.to_dict() for k, v in self._data.items()}
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"InMemoryEtcd persist failed for {self.path}: {e}")
 
     def put(self, shard: Shard) -> None:
         with self._lock:
             self._data[shard.id] = shard
+        self._persist()
 
     def get(self, shard_id: str) -> Shard | None:
         with self._lock:
@@ -34,6 +91,7 @@ class InMemoryEtcd:
     def delete(self, shard_id: str) -> None:
         with self._lock:
             self._data.pop(shard_id, None)
+        self._persist()
 
     def all(self) -> list[Shard]:
         with self._lock:
@@ -88,17 +146,18 @@ class Etcd3Store:
         if not val:
             return None
         d = json.loads(val.decode())
-        return Shard(**{k: v for k, v in d.items() if k in Shard.__dataclass_fields__})
+        return _shard_from_dict(d)
 
-    def list_by_namespace(self, namespace: str) -> list[Shard]:
+    def _list_dicts(self) -> list[dict]:
         self._ensure()
         assert self._client is not None
-        out: list[Shard] = []
+        out: list[dict] = []
         for val, _ in self._client.get_prefix("/vsector/shards/"):  # type: ignore
-            d = json.loads(val.decode())
-            if d.get("namespace") == namespace:
-                out.append(Shard(id=d["id"], namespace=d["namespace"], node_id=d.get("node_id", ""), vector_count=d.get("vector_count", 0), max_vectors=d.get("max_vectors", 50_000_000_000)))
+            out.append(json.loads(val.decode()))
         return out
+
+    def list_by_namespace(self, namespace: str) -> list[Shard]:
+        return [s for s in (_shard_from_dict(d) for d in self._list_dicts()) if s.namespace == namespace]
 
     def delete(self, shard_id: str) -> None:
         self._ensure()
@@ -106,13 +165,7 @@ class Etcd3Store:
         self._client.delete(self._key(shard_id))  # type: ignore
 
     def all(self) -> list[Shard]:
-        self._ensure()
-        assert self._client is not None
-        out: list[Shard] = []
-        for val, _ in self._client.get_prefix("/vsector/shards/"):  # type: ignore
-            d = json.loads(val.decode())
-            out.append(Shard(id=d["id"], namespace=d["namespace"], node_id=d.get("node_id", ""), vector_count=d.get("vector_count", 0)))
-        return out
+        return [_shard_from_dict(d) for d in self._list_dicts()]
 
     def watch_prefix(self, prefix: str, callback):
         self._ensure()
