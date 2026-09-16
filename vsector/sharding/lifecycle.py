@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 class ShardLifecycleManager:
     """Validated lifecycle/ownership operations over a shard store (etcd)."""
 
-    def __init__(self, store):
+    def __init__(self, store, membership=None):
         self._store = store
+        # Optional VS-11 cluster membership: when provided, primary owners (and
+        # new owners on ownership change) must be known cluster members. In
+        # self-contained unit usage (no membership), VS-10 behavior is unchanged.
+        self._membership = membership
 
     # --- creation -----------------------------------------------------------
 
@@ -44,6 +48,8 @@ class ShardLifecycleManager:
         if replicas is not None:
             shard.replicas = list(replicas)
         shard.validate_ownership()
+        if self._membership is not None:
+            self._membership.validate_node(shard.node_id)
         shard.state = ShardState.CREATING
         self._store.put(shard)
         return shard
@@ -92,6 +98,8 @@ class ShardLifecycleManager:
             )
         if not new_owner:
             raise NoPrimaryOwnerError(shard.namespace, shard.id)
+        if self._membership is not None:
+            self._membership.validate_node(new_owner)
         new_replicas = list(shard.replicas) if replicas is None else list(replicas)
         if new_owner in new_replicas:
             raise OwnershipConflictError(

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     shard_default_count: int = 8
     routing_cache_ttl_s: int = 5
 
+    # Cluster membership (VS-11)
+    cluster_id: str = "vsector-cluster-default"  # stable cluster identity (VSECTOR_CLUSTER_ID)
+
     # Index
     hnsw_m: int = 16
     hnsw_ef_construction: int = 200

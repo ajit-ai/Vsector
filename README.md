@@ -87,6 +87,22 @@ class Namespace:
 
 **Persistence & restart (VS-10)** — when the shard store is durable (`EtcdStore(path=...)`), shard **identity is stable across restart** (deterministic ids instead of regenerated uuids), and persisted lifecycle state + primary owner are reconstructed truthfully: a `DRAINING`/`OFFLINE` shard is never fabricated `ACTIVE` by a restart. Without a durable shard store, no shard metadata survives a restart and the process boots a fresh `ACTIVE` topology (honest: it makes no claim about prior state).
 
+### Module 2b: Cluster Membership & Ownership Integration — `vsector/cluster/`
+
+**Cluster identity & node identity (VS-11)** — a deployment has a stable `cluster_id` (`VSECTOR_CLUSTER_ID`, deterministic default `vsector-cluster-default`, never regenerated per restart) and each node has a stable `node_id` (`VSECTOR_NODE_ID`, reused unchanged from VS-10 for shard ownership). `cluster_id`, `node_id`, and `shard_id` are three distinct identities and are never conflated. A `ClusterNode` record minimally carries `node_id`, `cluster_id`, `membership_state`, and a transition `version`.
+
+**Membership lifecycle (VS-11)** — explicit states `JOINING → ACTIVE → DRAINING → REMOVED` with validated transitions: `JOINING → {ACTIVE, REMOVED}`, `ACTIVE → {DRAINING, REMOVED}`, `DRAINING → {ACTIVE, REMOVED}`, `REMOVED` terminal. All transitions go through `ClusterNode.transition` / `ClusterMembershipManager`; arbitrary jumps raise a deterministic `InvalidMembershipTransitionError` and never silently change state. Duplicate registration raises `DuplicateNodeRegistrationError`; unknown nodes raise `UnknownNodeError`; a removed node raises `RemovedNodeError` (still *known*, just no longer a member). Persistence reuses the same etcd abstraction as shards (one coherent metadata model — cluster nodes live under a reserved prefix in the durable store).
+
+**Local node startup (VS-11)** — on server start the local node is registered `JOINING → ACTIVE`. A persisted `ACTIVE` local node is restored as `ACTIVE`; a persisted `DRAINING`/`REMOVED` state is restored truthfully (a restart never fabricates `ACTIVE` membership). Membership is never fabricated for arbitrary nodes, and there is **no distributed discovery** in VS-11.
+
+**Ownership validation against membership (VS-11)** — VS-10's ownership remains authoritative (`shard.node_id` is the primary owner, `shard.replicas` the replica membership; no second representation). VS-11 validates it: a shard whose primary owner is not a known, non-removed cluster member raises a deterministic `UnknownNodeError`/`RemovedNodeError` during routing (`ShardRouter.route`/`route_write`) and lifecycle operations (`ShardLifecycleManager.create`, `change_owner` — new owners must be known members, and the VS-10 `DRAINING` requirement is preserved). No shard is silently adopted, rerouted, migrated, or transferred. Replica validation is exposed as an explicit operation (`ClusterMembershipManager.validate_replicas`) used where a control-plane operation requires it.
+
+**Membership is NOT health (VS-11)** — cluster membership state is a separate axis from VS-09 replication health: a node can be `ACTIVE` membership while a replica is unhealthy, and `DRAINING` membership does not automatically drain its shards or promote anyone. Membership never auto-changes shard lifecycle, replication readiness, or ownership.
+
+**Observability (VS-11)** — read-only endpoints `GET /cluster` (`cluster_id`, local `node_id`, `membership_state`, `known_nodes`), `GET /cluster/nodes`, and `GET /cluster/nodes/{node_id}`; node records are deterministic fresh copies.
+
+**Restart truthfulness (VS-11)** — cluster identity, node identity, membership state, shard ownership, and shard lifecycle persist and are restored consistently; replication health remains runtime-derived. Nothing is fabricated after restart: no healthy replicas, no successful deliveries, no automatic ownership transfer, no automatic failover.
+
 ### Module 3: Vector Index Engine — `vsector/index/`
 - **HNSW**: M 16-64, efConstruction 200-500, efSearch 50-200, maxLevel auto `log(n)/log(M)`, flat int32 adjacency, mmap files, level-0 NVMe, incremental build
 - **IVF-PQ**: nlist 4096-65536, nprobe 64-256, subspaces `dim/8`, 256 codes (8-bit), train on 1M samples, shared-mem codebook, 24h retrain. Uses FAISS if available else flat simulation.
@@ -111,6 +127,7 @@ class Namespace:
 vsector/
   models/       # VectorRecord, Namespace
   sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator
+  cluster/      # ClusterMembershipManager, ClusterNode, membership lifecycle (VS-11)
   index/        # BaseIndex, Flat, HNSW, IVF-PQ, lifecycle, factory
   storage/      # WAL, SegmentStore (MemTable/SSTable tiered), MetadataStore
   ingest/       # IngestService (write path)
@@ -126,7 +143,7 @@ proto/vsector.proto
 
 ## Configuration (12-factor via env `VSECTOR_*`)
 
-See `.env.example` and `vsector/infra/config.py`. Key vars: `VSECTOR_DATA_DIR`, `VSECTOR_NODE_ID` (stable local node identity for shard ownership), `VSECTOR_KAFKA_BOOTSTRAP_SERVERS`, `VSECTOR_ETCD_ENDPOINTS`, `VSECTOR_RATE_LIMIT_RPS`, `VSECTOR_SHARD_MAX_VECTORS`, `VSECTOR_WAL_SEGMENT_BYTES`, etc.
+See `.env.example` and `vsector/infra/config.py`. Key vars: `VSECTOR_DATA_DIR`, `VSECTOR_NODE_ID` (stable local node identity for shard ownership), `VSECTOR_CLUSTER_ID` (stable cluster identity), `VSECTOR_KAFKA_BOOTSTRAP_SERVERS`, `VSECTOR_ETCD_ENDPOINTS`, `VSECTOR_RATE_LIMIT_RPS`, `VSECTOR_SHARD_MAX_VECTORS`, `VSECTOR_WAL_SEGMENT_BYTES`, etc.
 
 ## Observability
 
@@ -154,8 +171,15 @@ make run       # vsector serve --reload
 
 Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_query.py` `test_api.py`
 
+## Distributed Capabilities Implemented vs Not Implemented
+
+Implemented (VS-10 → VS-11): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior.
+
+Not implemented (future: VS-12 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration, automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion. Membership state and health never masquerade as these capabilities.
+
 ## Roadmap / Production Hardening
 
+- VS-12 — Placement, Routing & Distributed Request Integration (next capability)
 - Replace `MetadataStore` JSON with PostgreSQL + migrations
 - Replace `EtcdStore` in-memory with real etcd + gossip
 - S3 tier for cold SSTables, CDC + disaster recovery

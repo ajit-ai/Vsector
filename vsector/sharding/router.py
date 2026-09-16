@@ -50,9 +50,13 @@ def _state_error(shard: Shard) -> ShardCreatingError | ShardDrainingError | Shar
 
 
 class ShardRouter:
-    def __init__(self, etcd: EtcdStore | None = None, cache_ttl_s: int = 5):
+    def __init__(self, etcd: EtcdStore | None = None, cache_ttl_s: int = 5, membership=None):
         self.etcd = etcd or EtcdStore()
         self.cache_ttl = cache_ttl_s
+        # Optional VS-11 cluster membership: when provided, every routed shard's
+        # primary owner must be a known (non-removed) cluster member. When absent
+        # (self-contained unit tests / host-mode), ownership is not cluster-checked.
+        self.membership = membership
         self._cache: Dict[str, tuple[float, List[Shard]]] = {}
         self._cache_lock = threading.RLock()
         self._hrw_cache: Dict[str, RendezvousHash] = {}
@@ -104,23 +108,36 @@ class ShardRouter:
                 return s
         return active[0]
 
+    def _validate_owner(self, shard: Shard) -> None:
+        """VS-11 ownership check: the primary owner must be a known cluster member.
+
+        Raises a deterministic cluster error (``UnknownNodeError`` /
+        ``RemovedNodeError``) when the owner is not a known, non-removed member.
+        No shard adoption, forwarding, or automatic transfer is ever attempted.
+        """
+        if self.membership is not None:
+            self.membership.validate_node(shard.require_owner())
+
     def route(self, namespace: str, record_id: str) -> Shard:
         """Resolve a record to its readable primary shard (does not fake availability)."""
         shard = self._select(namespace, record_id)
         if shard.state not in READABLE_STATES:
             raise _state_error(shard)
+        self._validate_owner(shard)
         return shard
 
     def route_write(self, namespace: str, record_id: str, owner_node_id: str | None = None) -> Shard:
         """Resolve a write to its primary-owner shard, enforcing lifecycle + ownership.
 
         Raises a deterministic error when the shard is CREATING / DRAINING /
-        OFFLINE or when this node is not the primary owner. Writes are never
-        silently rerouted to a different shard or forwarded to a replica.
+        OFFLINE, when its primary owner is not a known cluster member (VS-11),
+        or when this node is not the primary owner. Writes are never silently
+        rerouted to a different shard or forwarded to a replica.
         """
         shard = self._select(namespace, record_id)
         if shard.state is not ShardState.ACTIVE:
             raise _state_error(shard)
+        self._validate_owner(shard)
         owner = shard.require_owner()
         if owner_node_id is not None and owner != owner_node_id:
             raise OwnershipMismatchError(namespace, shard.id, owner, owner_node_id)

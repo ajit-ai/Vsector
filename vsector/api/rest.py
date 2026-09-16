@@ -22,6 +22,7 @@ from ..storage.metadata import MetadataStore
 from ..sharding.router import ShardRouter, EtcdStore
 from ..sharding.shard import Shard
 from ..sharding.lifecycle import ShardLifecycleManager
+from ..cluster.membership import ClusterMembershipManager, bootstrap_local_node
 from ..models.namespace import Namespace, DistanceMetric, IndexType, CompressionType
 from ..ingest.service import IngestService
 from ..query.engine import QueryEngine
@@ -37,10 +38,16 @@ logger = logging.getLogger(__name__)
 # singletons for single-node deployment
 metadata_store = MetadataStore(path=f"{settings.data_dir}/metadata.json")
 etcd = EtcdStore(path=f"{settings.data_dir}/shards.json")
-router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s)
+# VS-11: explicit cluster membership. The LOCAL node is registered at startup
+# (JOINING -> ACTIVE; a persisted ACTIVE/DRAINING/REMOVED state is restored
+# truthfully, never fabricated ACTIVE). No membership is fabricated for other
+# nodes and there is no distributed discovery in VS-11.
+cluster = ClusterMembershipManager(etcd, cluster_id=settings.cluster_id)
+_local_node = bootstrap_local_node(cluster, settings.node_id)
+router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s, membership=cluster)
+_lifecycle = ShardLifecycleManager(etcd, membership=cluster)
 ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir, node_id=settings.node_id)
 query_engine = QueryEngine(metadata=metadata_store, router=router, ingest_service=ingest)
-_lifecycle = ShardLifecycleManager(etcd)
 
 # Deterministic single-node topology: this node is the primary owner of every shard
 # it hosts; replicas are drawn from the fixed logical node pool (still in-process).
@@ -119,6 +126,27 @@ async def ready():
     return {"ready": recovery_ok,
             "namespaces": len(metadata_store.list()),
             "recovery": recovery_status or "complete"}
+
+# --- cluster membership (VS-11) --- read-only observer/operator visibility
+@app.get("/cluster", tags=["ops"])
+async def cluster_status():
+    return {
+        "cluster_id": cluster.cluster_id,
+        "node_id": settings.node_id,
+        "membership_state": _local_node.state.value,
+        "known_nodes": [n.to_dict() for n in cluster.list()],
+    }
+
+@app.get("/cluster/nodes", tags=["ops"])
+async def cluster_nodes():
+    return [n.to_dict() for n in cluster.list()]
+
+@app.get("/cluster/nodes/{node_id}", tags=["ops"])
+async def cluster_node(node_id: str):
+    node = cluster.get(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+    return node.to_dict()
 
 @app.get("/metrics", tags=["ops"])
 async def metrics():
