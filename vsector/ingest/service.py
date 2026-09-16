@@ -21,12 +21,12 @@ from ..storage.wal import WAL, WALEntry
 from ..storage.segment import SegmentStore
 from ..storage.recovery import recover
 from ..storage.metadata import MetadataStore
-from ..sharding.router import ShardRouter, EtcdStore
+from ..sharding.router import ShardRouter
 from ..sharding.shard import Shard
-from ..sharding.coordinator import ReplicationCoordinator
+from ..sharding.replication import InProcessReplicaTransport, ReplicaEndpoint, aggregate_replication
 from ..index.factory import create_index
 from ..index.lifecycle import IndexLifecycleManager
-from ..infra.metrics import INGEST_COUNTER
+from ..infra.metrics import INGEST_COUNTER, REPLICATION_ATTEMPTS, REPLICATION_ACKS, REPLICATION_FAILURES, REPLICATION_DEGRADED
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +59,45 @@ class IngestService:
         self.metadata = metadata
         self.router = router
         self.base_dir = base_dir
-        self.replicator = ReplicationCoordinator()
+        # Real replication transport: applies writes to independently represented in-process
+        # replica contexts and reports actual success/degraded/failure (VS-09.2).
+        self.replicator = InProcessReplicaTransport(self._get_or_create_replica_endpoint)
+        self._replica_endpoints: dict[str, ReplicaEndpoint] = {}
+        self._replica_base_dir = f"{base_dir}/replicas"
+        self._replication_stats: dict[str, dict[str, int]] = {}
         self._shards: dict[str, ShardContext] = {}
         self._idempotency: dict[str, dict] = {}
         self._lock = asyncio.Lock()
+
+    def _get_or_create_replica_endpoint(self, namespace: str, shard: Shard, node_id: str) -> ReplicaEndpoint:
+        key = f"{namespace}:{shard.id}:{node_id}"
+        endpoint = self._replica_endpoints.get(key)
+        if endpoint is None:
+            ns = self.metadata.get(namespace)
+            if not ns:
+                raise ValueError(f"namespace {namespace!r} not found")
+            # Independent replica state: dedicated shard id + dedicated storage dirs so the
+            # replica's WAL / SegmentStore / index / tombstones are never the primary's objects.
+            replica_shard = Shard(id=f"{shard.id}#replica-{node_id}", namespace=namespace, node_id=node_id)
+            ctx = ShardContext(replica_shard, ns, self._replica_base_dir)
+            endpoint = ReplicaEndpoint(node_id, ctx)
+            self._replica_endpoints[key] = endpoint
+        return endpoint
+
+    def _record_replication_stats(self, namespace: str, shard: Shard, repl) -> None:
+        key = f"{namespace}:{shard.id}"
+        st = self._replication_stats.setdefault(key, {"attempts": 0, "acks": 0, "failures": 0, "degraded": 0})
+        st["attempts"] += len(repl.attempted_replicas)
+        st["acks"] += len(repl.acknowledged_replicas)
+        st["failures"] += len(repl.failed_replicas)
+        if repl.degraded:
+            st["degraded"] += 1
+        REPLICATION_ATTEMPTS.labels(namespace=namespace).inc(len(repl.attempted_replicas))
+        REPLICATION_ACKS.labels(namespace=namespace).inc(len(repl.acknowledged_replicas))
+        for node_id in repl.failed_replicas:
+            REPLICATION_FAILURES.labels(namespace=namespace, replica_id=node_id).inc()
+        if repl.degraded:
+            REPLICATION_DEGRADED.labels(namespace=namespace).inc()
 
     def _get_or_create_ctx(self, namespace: str, shard: Shard) -> ShardContext:
         key = f"{namespace}:{shard.id}"
@@ -88,6 +123,7 @@ class IngestService:
         upserted: list[str] = []
         errors: list[dict] = []
         touched: dict[str, ShardContext] = {}
+        replication_results = []
 
         for raw in records:
             try:
@@ -118,14 +154,16 @@ class IngestService:
                 ctx.tombstones.discard(str(rec.id))  # re-insert resurrects a previously deleted id
                 # Shard Router -> Primary Shard Node -> MemTable
                 ctx.segments.put(rec)
-                # Replicate to 2 followers (async quorum ack)
-                self.replicator.replicate_async(payload, shard.replicas)
-                # Index merge (in-memory buffer -> index; background SSTable flush handled inside segments)
-                # Incremental build: insert directly into live index
+                # Index merge: insert directly into live index (primary local apply)
                 ctx.index.add([str(rec.id)], np.array([rec.vector], dtype=np.float32), [rec.metadata])
                 ctx.lifecycle.notify_write(1)
                 ctx.shard.vector_count += 1
                 shard.vector_count = ctx.shard.vector_count
+                # Replicate to replicas through the real application path (primary is durable/local).
+                # Outcome is structured and reflects actual replica application results.
+                repl = self.replicator.replicate_upsert(namespace, shard, payload, required_acks=ns.required_acks)
+                replication_results.append(repl)
+                self._record_replication_stats(namespace, shard, repl)
                 # maybe split
                 self.router.maybe_split(shard, on_split=lambda p,a,b: logger.info(f"Shard split {p.id} -> {a.id},{b.id}"))
                 upserted.append(str(rec.id))
@@ -146,6 +184,12 @@ class IngestService:
                 ctx.lifecycle.maybe_compact()
 
         result = {"upserted": len(upserted), "ids": upserted, "errors": errors, "took_ms": int((time.time()-t0)*1000)}
+        # Replication outcome (additive, backward compatible). If any record failed on the
+        # primary, the request cannot claim fully replicated success.
+        repl_summary = aggregate_replication(replication_results, ns.required_acks)
+        if errors:
+            repl_summary["success"] = False
+        result["replication"] = repl_summary
         if idempotency_key:
             self._idempotency[idempotency_key] = result
         return result
@@ -157,6 +201,7 @@ class IngestService:
         deleted = 0
         shards = self.router.route_for_query(namespace)
         touched: dict[str, ShardContext] = {}
+        replication_results = []
         for shard in shards:
             ctx = self._get_or_create_ctx(namespace, shard)
             if ids:
@@ -169,8 +214,13 @@ class IngestService:
                     ctx.lifecycle.notify_delete(1)
                     ctx.tombstones.add(_id)  # hide any stale SSTable copy during this process lifetime
                     # durable tombstone so WAL replay does not resurrect the record
-                    ctx.wal.append(WALEntry(payload=json.dumps({"__op": "delete", "id": _id}).encode()))
+                    payload = json.dumps({"__op": "delete", "id": _id}).encode()
+                    ctx.wal.append(WALEntry(payload=payload))
                     touched[f"{namespace}:{shard.id}"] = ctx
+                    # replicate the tombstone to replicas through the real application path
+                    repl = self.replicator.replicate_delete(namespace, shard, payload, required_acks=ns.required_acks)
+                    replication_results.append(repl)
+                    self._record_replication_stats(namespace, shard, repl)
                     deleted += 1
             elif filter:
                 # naive filter scan
@@ -179,13 +229,17 @@ class IngestService:
                         ctx.index.delete([str(rec.id)])
                         ctx.segments.memtable.delete(str(rec.id))
                         ctx.tombstones.add(str(rec.id))
-                        ctx.wal.append(WALEntry(payload=json.dumps({"__op": "delete", "id": str(rec.id)}).encode()))
+                        payload = json.dumps({"__op": "delete", "id": str(rec.id)}).encode()
+                        ctx.wal.append(WALEntry(payload=payload))
                         touched[f"{namespace}:{shard.id}"] = ctx
+                        repl = self.replicator.replicate_delete(namespace, shard, payload, required_acks=ns.required_acks)
+                        replication_results.append(repl)
+                        self._record_replication_stats(namespace, shard, repl)
                         deleted += 1
         # Batch WAL fsync for tombstones
         for ctx in touched.values():
             ctx.wal.flush()
-        return {"deleted": deleted}
+        return {"deleted": deleted, "replication": aggregate_replication(replication_results, ns.required_acks)}
 
     def _matches_filter(self, md: dict, f: dict) -> bool:
         for k, cond in f.items():
@@ -235,5 +289,6 @@ class IngestService:
                 "degraded": getattr(v.index, "degraded", False),
                 "recovered_from_wal": v.recovery.recovered_from_wal,
                 "wal_entries_read": v.recovery.wal_entries_read,
+                "replication": self._replication_stats.get(k, {"attempts": 0, "acks": 0, "failures": 0, "degraded": 0}),
             }
         return out

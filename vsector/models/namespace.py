@@ -33,6 +33,7 @@ class Namespace(BaseModel):
     distance_metric: DistanceMetric = DistanceMetric.COSINE
     index_type: IndexType = IndexType.HNSW
     replication_factor: int = Field(default=3, ge=1, le=7)
+    required_acks: int = Field(default=1, ge=1, le=7, description="Total durable acks required per write (primary counts as 1); 1 = primary durable write is sufficient")
     shard_count: int = Field(default=8, ge=1, le=1024, description="Auto-calculated based on expected record count")
     compression: CompressionType = CompressionType.NONE
     tenant_id: uuid.UUID = Field(default_factory=uuid.uuid4)

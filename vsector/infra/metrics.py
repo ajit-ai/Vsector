@@ -7,3 +7,7 @@ QUERY_LATENCY = Histogram("vsector_query_latency_ms", "Query latency ms", ["name
 INDEX_SIZE = Gauge("vsector_index_vectors", "Vectors per shard", ["namespace", "shard_id", "index_type"])
 WAL_SIZE = Gauge("vsector_wal_bytes", "WAL bytes", ["shard_id"])
 SHARD_COUNT = Gauge("vsector_shard_count", "Shard count", ["namespace"])
+REPLICATION_ATTEMPTS = Counter("vsector_replication_attempts_total", "Replication attempts (replicas targeted)", ["namespace"])
+REPLICATION_ACKS = Counter("vsector_replication_acks_total", "Replica acknowledgements", ["namespace"])
+REPLICATION_FAILURES = Counter("vsector_replication_failures_total", "Replica failures", ["namespace", "replica_id"])
+REPLICATION_DEGRADED = Counter("vsector_replication_degraded_total", "Degraded writes", ["namespace"])
