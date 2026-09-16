@@ -1,4 +1,4 @@
-"""VS-09.2 / VS-09.3: real replication abstraction with failure semantics and health.
+"""VS-09.2 / VS-09.3 / VS-09.4: real replication abstraction with failure, health, observability.
 
 VS-09.2 replaces the simulated ``time.sleep(0.001); return True`` acknowledgement
 with a genuine application path: every replicated operation is applied to an
@@ -7,6 +7,11 @@ actual result.
 
 VS-09.3 adds a deterministic current health/readiness view derived from the same
 transport state - never fake, never a synthetic probe write.
+
+VS-09.4 hardens observability without changing the algorithm: per-replica
+last-success / last-failure timestamps, stable (object-repr-free) error summaries,
+deterministic JSON-serializable health snapshots, and a read-only inspection
+contract enforced by tests.
 
 Model:
 
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -74,13 +80,20 @@ class ReplicationResult:
 
 @dataclass
 class ReplicaHealth:
-    """Current transport-known health of one replica (per namespace/shard/node)."""
+    """Current transport-known health of one replica (per namespace/shard/node).
+
+    ``healthy`` means no currently known delivery failure; ``available`` is the
+    current fault state (whether a delivery could be attempted right now).  A
+    fault cleared without a subsequent successful delivery leaves ``healthy``
+    false - recovery requires real delivery, never a heal alone.
+    """
 
     replica_id: str
-    healthy: bool = True          # no currently known replication failure
+    healthy: bool = True          # no currently known delivery failure
     available: bool = True        # can currently participate (not faulted)
     last_error: str | None = None
-    last_success: float | None = None  # monotonic ts of last confirmed ack
+    last_success: float | None = None  # unix ts of last confirmed ack
+    last_failure: float | None = None  # unix ts of last observed failure
     successes: int = 0
     failures: int = 0
 
@@ -91,6 +104,7 @@ class ReplicaHealth:
             "available": self.available,
             "last_error": self.last_error,
             "last_success": self.last_success,
+            "last_failure": self.last_failure,
             "successes": self.successes,
             "failures": self.failures,
         }
@@ -138,6 +152,17 @@ def _decode(payload: bytes | bytearray | str) -> str:
     if isinstance(payload, (bytes, bytearray)):
         return payload.decode("utf-8")
     return payload
+
+
+_OBJECT_REPR_RE = re.compile(r"<[^>]*? at 0x[0-9a-fA-F]+>")
+
+
+def _stable_error(exc: Exception) -> str:
+    """Stable, diagnosable error summary: ``Type: message`` with no memory
+    addresses and no tracebacks, safe for API/metrics surfaces."""
+    msg = _OBJECT_REPR_RE.sub("<...>", str(exc))
+    msg = " ".join(msg.split())
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
 def apply_replicated_upsert(ctx, payload: bytes) -> None:
@@ -267,6 +292,8 @@ class InProcessReplicaTransport:
 
     # --- health tracking ---------------------------------------------------
     def _record_node(self, namespace: str, shard_id: str, node_id: str, ok: bool, error: str | None = None) -> None:
+        """Record one observed delivery outcome. Counters and health only change
+        when a delivery actually succeeds or actually fails."""
         key = (namespace, shard_id, node_id)
         rec = self._health.get(key)
         if rec is None:
@@ -281,12 +308,14 @@ class InProcessReplicaTransport:
             rec.healthy = False
             rec.available = not self.is_faulted(node_id)
             rec.last_error = error or "unknown"
+            rec.last_failure = time.time()
             rec.failures += 1
         self._health[key] = rec
 
     def replication_health(self, namespace: str, shard, required_acks: int, primary_available: bool = True) -> ReplicationHealth:
         """Current health/readiness for ``shard``. Pure read: never mutates replica state,
-        never touches the WAL, never creates endpoints, never performs writes.
+        never touches the WAL, never creates endpoints, never invokes the endpoint
+        provider, never performs writes, never changes counters or timestamps.
         """
         shard_key = (namespace, shard.id)
         replicas: list[ReplicaHealth] = []
@@ -302,6 +331,7 @@ class InProcessReplicaTransport:
                     available=not self.is_faulted(node_id),
                     last_error=rec.last_error,
                     last_success=rec.last_success,
+                    last_failure=rec.last_failure,
                     successes=rec.successes,
                     failures=rec.failures,
                 )
@@ -340,9 +370,10 @@ class InProcessReplicaTransport:
                 result.acknowledged_replicas.append(node_id)
             except Exception as e:  # surfaced as a failed replica, never as success
                 logger.warning(f"replication {op} to {node_id} failed: {e}")
-                self._record_node(namespace, shard.id, node_id, ok=False, error=str(e))
+                err = _stable_error(e)
+                self._record_node(namespace, shard.id, node_id, ok=False, error=err)
                 result.failed_replicas.append(node_id)
-                result.failures[node_id] = str(e)
+                result.failures[node_id] = err
 
         # the primary's own durable write always counts as 1 ack
         ack_total = 1 + len(result.acknowledged_replicas)
