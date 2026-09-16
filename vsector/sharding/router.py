@@ -14,6 +14,17 @@ VS-10 adds explicit lifecycle/ownership-aware routing:
 
 HRW membership is the full shard set so record placement is stable; lifecycle
 checks are applied to the selected shard.
+
+VS-11 owner validation: when the router is wired to a ``ClusterMembershipManager``
+(``membership=...``), the primary owner of every routed shard must be a known,
+non-removed cluster member.
+
+VS-12 adds the explicit, side-effect-free decision layer (``place``,
+``route_read_decision``, ``route_write_decision``, ``query_route``,
+``placement_view``): every decision clearly answers *which shard*, *who owns it*,
+*is the owner a known member*, and *LOCAL / REMOTE / UNAVAILABLE* relative to the
+local node. A REMOTE decision is a routing *decision only* — no cross-node
+transport is executed.
 """
 from __future__ import annotations
 
@@ -23,12 +34,15 @@ import hashlib
 from typing import Dict, List
 
 from .hash_ring import RendezvousHash
+from ..cluster.exceptions import RemovedNodeError, UnknownNodeError
 from .exceptions import (
     OwnershipMismatchError,
+    PlacementError,
     ShardCreatingError,
     ShardDrainingError,
     ShardOfflineError,
 )
+from .placement import RouteType, RoutingDecision
 from .shard import Shard, ShardState
 
 # Abstract etcd - in-memory for single-node; pluggable for distributed
@@ -161,6 +175,136 @@ class ShardRouter:
                 raise OwnershipMismatchError(namespace, shard.id, owner, owner_node_id)
             out.append(shard)
         return out
+
+    # --- VS-12 deterministic placement & local/remote routing decisions ------
+
+    def _select_or_raise(self, namespace: str, record_id: str) -> Shard:
+        """Deterministic HRW selection with a defined ``PlacementError`` contract."""
+        try:
+            return self._select(namespace, record_id)
+        except KeyError as e:
+            raise PlacementError(namespace, str(e)) from None
+
+    def _decision_for(self, namespace: str, shard: Shard, local_node_id: str | None,
+                      mode: str = "any") -> RoutingDecision:
+        """Build a side-effect-free decision for a selected shard.
+
+        ``mode``: "any" (placement only), "read" (lifecycle-readable), or
+        "write" (writable/ACTIVE). Lifecycle, ownership, replication health,
+        membership, and persisted metadata are never mutated.
+        """
+        owner = shard.node_id or None
+        state_value = shard.state.value
+        reason: str | None = None
+        owner_state: str | None = None
+
+        if mode == "read":
+            if shard.state not in READABLE_STATES:
+                reason = f"shard state={state_value} is not readable (requires ACTIVE/DRAINING)"
+        elif mode == "write":
+            if shard.state is not ShardState.ACTIVE:
+                reason = (
+                    f"shard state={state_value} is not writable (requires ACTIVE); "
+                    "DRAINING/OFFLINE/CREATING never become writable silently"
+                )
+        if reason is None and owner is None:
+            reason = "shard has no primary owner"
+        if reason is None:
+            if self.membership is not None:
+                try:
+                    self.membership.validate_node(owner)
+                    owner_state = self.membership.membership_state(owner)
+                except UnknownNodeError:
+                    owner_state = "unknown"
+                    reason = f"primary owner {owner!r} is not a known cluster member"
+                except RemovedNodeError:
+                    owner_state = "REMOVED"
+                    reason = (
+                        f"primary owner {owner!r} is REMOVED from the cluster; "
+                        "ownership is never transferred automatically"
+                    )
+
+        if reason is not None:
+            route_type = RouteType.UNAVAILABLE
+        elif local_node_id is not None and owner == local_node_id:
+            route_type = RouteType.LOCAL
+        else:
+            route_type = RouteType.REMOTE
+
+        return RoutingDecision(
+            namespace=namespace,
+            shard_id=shard.id,
+            shard_state=state_value,
+            owner_node_id=owner,
+            local_node_id=local_node_id,
+            target=owner,
+            route_type=route_type,
+            owner_membership_state=owner_state,
+            reason=reason,
+        )
+
+    def place(self, namespace: str, record_id: str, local_node_id: str | None = None) -> RoutingDecision:
+        """Deterministic placement decision: which shard + owner handles this record."""
+        shard = self._select_or_raise(namespace, record_id)
+        return self._decision_for(namespace, shard, local_node_id, mode="any")
+
+    def route_read_decision(self, namespace: str, record_id: str, local_node_id: str | None = None) -> RoutingDecision:
+        """Lifecycle-aware read routing decision (readable shard states only)."""
+        shard = self._select_or_raise(namespace, record_id)
+        return self._decision_for(namespace, shard, local_node_id, mode="read")
+
+    def route_write_decision(self, namespace: str, record_id: str, local_node_id: str | None = None) -> RoutingDecision:
+        """Lifecycle- and ownership-aware write routing decision (ACTIVE + owner)."""
+        shard = self._select_or_raise(namespace, record_id)
+        return self._decision_for(namespace, shard, local_node_id, mode="write")
+
+    def query_route(self, namespace: str, local_node_id: str | None = None) -> list[RoutingDecision]:
+        """Deterministic multi-shard read fan-out: one decision per readable shard."""
+        shards = self._get_shards_cached(namespace)
+        return [self._decision_for(namespace, s, local_node_id, mode="read")
+                for s in shards if s.state in READABLE_STATES]
+
+    def shard_placement(self, shard: Shard, local_node_id: str | None = None) -> dict:
+        """Placement metadata (fresh copies) for one shard, membership-aware."""
+        owner = shard.node_id or None
+        owner_state: str | None = None
+        reason: str | None = None
+        route_type = RouteType.LOCAL if (local_node_id is not None and owner == local_node_id) else RouteType.REMOTE
+        if self.membership is not None:
+            if owner is None:
+                reason = "shard has no primary owner"
+                route_type = RouteType.UNAVAILABLE
+            else:
+                try:
+                    self.membership.validate_node(owner)
+                    owner_state = self.membership.membership_state(owner)
+                except UnknownNodeError:
+                    owner_state = "unknown"
+                    reason = "primary owner is not a known cluster member"
+                    route_type = RouteType.UNAVAILABLE
+                except RemovedNodeError:
+                    owner_state = "REMOVED"
+                    reason = "primary owner is REMOVED from the cluster"
+                    route_type = RouteType.UNAVAILABLE
+        return {
+            "shard_id": shard.id,
+            "state": shard.state.value,
+            "primary_owner": owner,
+            "replicas": list(shard.replicas),
+            "owner_membership_state": owner_state,
+            "route_type": route_type.value,
+            "target": owner,
+            "reason": reason,
+        }
+
+    def placement_view(self, namespace: str, local_node_id: str | None = None) -> dict:
+        """Fresh-copy placement metadata for a namespace (no mutable internals)."""
+        return {
+            "namespace": namespace,
+            "local_node_id": local_node_id,
+            "shards": [self.shard_placement(s, local_node_id)
+                       for s in self.etcd.list_by_namespace(namespace)],
+        }
 
     # --- Shard Split Algorithm (zero-downtime) ---
     def maybe_split(self, shard: Shard, on_split) -> List[Shard] | None:

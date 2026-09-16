@@ -148,6 +148,38 @@ async def cluster_node(node_id: str):
         raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
     return node.to_dict()
 
+# --- placement / routing (VS-12) --- read-only operator/observer visibility
+@app.get("/cluster/placement", tags=["ops"])
+async def cluster_placement():
+    namespaces = metadata_store.list()
+    return {
+        "cluster_id": cluster.cluster_id,
+        "local_node_id": settings.node_id,
+        "namespaces": [router.placement_view(ns.name, settings.node_id) for ns in namespaces],
+    }
+
+@app.get(f"{settings.api_prefix}/namespaces/{{namespace}}/placement", tags=["namespaces"])
+async def namespace_placement(namespace: str):
+    ns = metadata_store.get(namespace)
+    if not ns:
+        raise HTTPException(status_code=404, detail="namespace not found")
+    view = router.placement_view(namespace, settings.node_id)
+    view["dimension"] = ns.dimension
+    view["shard_count"] = len(view["shards"])
+    return view
+
+@app.get(f"{settings.api_prefix}/namespaces/{{namespace}}/shards", tags=["namespaces"])
+async def namespace_shards(namespace: str):
+    ns = metadata_store.get(namespace)
+    if not ns:
+        raise HTTPException(status_code=404, detail="namespace not found")
+    view = router.placement_view(namespace, settings.node_id)
+    return {
+        "namespace": namespace,
+        "local_node_id": settings.node_id,
+        "shards": view["shards"],
+    }
+
 @app.get("/metrics", tags=["ops"])
 async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

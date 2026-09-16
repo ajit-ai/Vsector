@@ -103,6 +103,16 @@ class Namespace:
 
 **Restart truthfulness (VS-11)** — cluster identity, node identity, membership state, shard ownership, and shard lifecycle persist and are restored consistently; replication health remains runtime-derived. Nothing is fabricated after restart: no healthy replicas, no successful deliveries, no automatic ownership transfer, no automatic failover.
 
+### Module 2c: Placement & Local/Remote Routing Decisions — `vsector/sharding/placement.py`
+
+**Deterministic placement (VS-12)** — every record maps to exactly one shard by HRW over the authoritative, persisted shard set (never manufactured by the router). A shard with no owner, an unknown owner, or a removed owner yields a deterministic decision, not a silent adoption/reroute. Placement is stable across restarts and identical from any node that shares the same metadata.
+
+**Explicit routing decisions (VS-12)** — `place()`, `route_read_decision()`, `route_write_decision()`, and `query_route()` return an immutable `RoutingDecision` answering four questions: *which shard*, *who owns it*, *is the owner a known member*, and *LOCAL / REMOTE / UNAVAILABLE* relative to the local node. `LOCAL` means the owner is this node (process the request here), `REMOTE` means the owner is another known node (a decision *only* — see non-goals), and `UNAVAILABLE` carries a deterministic, user-actionable `reason` (non-writable lifecycle state, no primary owner, owner not a cluster member, owner removed). The existing VS-10 `route_write` gate is preserved: a `REMOTE` decision never triggers a local write, and `IngestService` never fabricates local success.
+
+**Lifecycle/membership-aware (VS-12)** — read decisions require readable states (`ACTIVE`/`DRAINING`); write decisions require `ACTIVE` (a `DRAINING` shard is never silently writable). The owner is validated against VS-11 membership: unknown owners and removed owners make the decision `UNAVAILABLE` without transferring ownership, promoting replicas, or mutating any metadata. Routing is side-effect free — decisions never change shard state, versions, ownership, membership, or persisted files.
+
+**Observability (VS-12)** — read-only operator endpoints `GET /cluster/placement` (cluster-wide), `GET /v1/namespaces/{namespace}/placement`, and `GET /v1/namespaces/{namespace}/shards`, returning fresh-copy placement metadata (`state`, `primary_owner`, `replicas`, `owner_membership_state`, `route_type`, `target`, `reason`). Unknown namespaces return 404; failed placements/decisions map to 400 via `PlacementError`/`RoutingError`.
+
 ### Module 3: Vector Index Engine — `vsector/index/`
 - **HNSW**: M 16-64, efConstruction 200-500, efSearch 50-200, maxLevel auto `log(n)/log(M)`, flat int32 adjacency, mmap files, level-0 NVMe, incremental build
 - **IVF-PQ**: nlist 4096-65536, nprobe 64-256, subspaces `dim/8`, 256 codes (8-bit), train on 1M samples, shared-mem codebook, 24h retrain. Uses FAISS if available else flat simulation.
@@ -126,7 +136,7 @@ class Namespace:
 ```
 vsector/
   models/       # VectorRecord, Namespace
-  sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator
+  sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator, Placement/RoutingDecision (VS-12)
   cluster/      # ClusterMembershipManager, ClusterNode, membership lifecycle (VS-11)
   index/        # BaseIndex, Flat, HNSW, IVF-PQ, lifecycle, factory
   storage/      # WAL, SegmentStore (MemTable/SSTable tiered), MetadataStore
@@ -169,17 +179,17 @@ make lint      # ruff check
 make run       # vsector serve --reload
 ```
 
-Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_query.py` `test_api.py`
+Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_query.py` `test_api.py` `test_shard_lifecycle.py` `test_cluster_membership.py` `test_placement_routing.py`
 
 ## Distributed Capabilities Implemented vs Not Implemented
 
-Implemented (VS-10 → VS-11): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior.
+Implemented (VS-10 → VS-12): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing.
 
-Not implemented (future: VS-12 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration, automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion. Membership state and health never masquerade as these capabilities.
+Not implemented (future: VS-13 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration, automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion, distributed result merging. A `REMOTE` routing decision is a decision only — no cross-node transport is executed. Membership state and health never masquerade as these capabilities.
 
 ## Roadmap / Production Hardening
 
-- VS-12 — Placement, Routing & Distributed Request Integration (next capability)
+- VS-13 — Shard Migration & Rebalancing (next capability)
 - Replace `MetadataStore` JSON with PostgreSQL + migrations
 - Replace `EtcdStore` in-memory with real etcd + gossip
 - S3 tier for cold SSTables, CDC + disaster recovery

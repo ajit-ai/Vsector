@@ -16,6 +16,10 @@ __all__ = [
     "OwnershipMismatchError",
     "OwnershipConflictError",
     "InvalidLifecycleTransitionError",
+    "RoutingError",
+    "PlacementError",
+    "RemoteRouteRequiredError",
+    "ShardUnavailableError",
 ]
 
 
@@ -90,3 +94,35 @@ class InvalidLifecycleTransitionError(ShardLifecycleError):
         self.shard_id = shard_id
         self.current = current
         self.target = target
+
+
+class RoutingError(ValueError):
+    """Base class for VS-12 placement/routing decision failures."""
+
+
+class PlacementError(RoutingError):
+    def __init__(self, namespace: str, reason: str):
+        super().__init__(f"placement error: namespace {namespace!r}: {reason}")
+        self.namespace = namespace
+        self.reason = reason
+
+
+class ShardUnavailableError(RoutingError):
+    def __init__(self, namespace: str, shard_id: str, reason: str):
+        super().__init__(f"shard unavailable: {namespace}:{shard_id}: {reason}")
+        self.namespace = namespace
+        self.shard_id = shard_id
+        self.reason = reason
+
+
+class RemoteRouteRequiredError(RoutingError):
+    def __init__(self, namespace: str, shard_id: str, owner: str, local_node: str):
+        super().__init__(
+            f"remote route required: {namespace}:{shard_id} is owned by {owner!r} "
+            f"(remote from local node {local_node!r}); no local write is performed and "
+            "cross-node transport is not implemented"
+        )
+        self.namespace = namespace
+        self.shard_id = shard_id
+        self.owner = owner
+        self.local_node = local_node
