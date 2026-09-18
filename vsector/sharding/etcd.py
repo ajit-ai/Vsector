@@ -1,27 +1,144 @@
-"""Etcd backends: InMemory + real etcd3 with gossip invalidation."""
+"""Etcd backends: InMemory + real etcd3 with gossip invalidation.
 
+VS-10 adds optional JSON durability to the in-memory backend
+(``InMemoryEtcd(path=...)``): shard identity, lifecycle state, and ownership
+metadata are persisted so they survive a process restart. Shard objects are
+reconstructed from persisted dicts with proper ``ShardState`` coercion (never a
+raw string in a typed field) and never rely on object memory addresses.
+
+VS-11 persists cluster membership (``ClusterNode`` records) through the SAME
+store, under a reserved key prefix, so there is one coherent metadata model:
+identity, membership, and shard ownership survive a restart together.
+"""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 
-from .shard import Shard
+from ..cluster.node import ClusterNode, NodeMembershipState
+from .migration import MigrationState, ShardMigration
+from .shard import Shard, ShardState
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_VECTORS = 50_000_000_000
+
+# Reserved key prefix for cluster membership records inside the shard store.
+_CLUSTER_KEY_PREFIX = "cluster::node::"
+
+# Reserved key prefix for durable shard-migration records (VS-13), same store.
+_MIGRATION_KEY_PREFIX = "migration::"
+
+
+def _migration_from_dict(d: dict) -> ShardMigration:
+    try:
+        state = MigrationState(str(d.get("state", MigrationState.PENDING.value)))
+    except ValueError:
+        logger.warning(f"migration {d.get('migration_id', '?')}: unknown persisted state {d.get('state')!r}; defaulting to PENDING")
+        state = MigrationState.PENDING
+    return ShardMigration(
+        migration_id=d.get("migration_id", ""),
+        namespace=d.get("namespace", ""),
+        shard_id=d.get("shard_id", ""),
+        source_node_id=d.get("source_node_id", ""),
+        target_node_id=d.get("target_node_id", ""),
+        state=state,
+        source_version=int(d.get("source_version", 1)),
+        cluster_id=d.get("cluster_id", "vsector-cluster-default"),
+        created_at=float(d.get("created_at", 0.0)),
+        updated_at=float(d.get("updated_at", 0.0)),
+        error=d.get("error"),
+        version=int(d.get("version", 1)),
+        source_digest=d.get("source_digest"),
+        target_digest=d.get("target_digest"),
+        finalized=bool(d.get("finalized", False)),
+    )
+
+
+def _node_from_dict(d: dict) -> ClusterNode:
+    try:
+        state = NodeMembershipState(str(d.get("membership_state", NodeMembershipState.ACTIVE.value)))
+    except ValueError:
+        logger.warning(f"cluster node {d.get('node_id', '?')}: unknown persisted state {d.get('membership_state')!r}; defaulting to ACTIVE")
+        state = NodeMembershipState.ACTIVE
+    return ClusterNode(
+        node_id=d.get("node_id", ""),
+        cluster_id=d.get("cluster_id", ""),
+        state=state,
+        version=int(d.get("version", 1)),
+    )
+
+
+def _state_from(value, shard_id: str) -> ShardState:
+    if isinstance(value, ShardState):
+        return value
+    try:
+        return ShardState(str(value))
+    except ValueError:
+        logger.warning(f"shard {shard_id}: unknown persisted state {value!r}; defaulting to ACTIVE")
+        return ShardState.ACTIVE
+
+
+def _shard_from_dict(d: dict) -> Shard:
+    return Shard(
+        id=d.get("id"),
+        namespace=d.get("namespace", ""),
+        node_id=d.get("node_id", "") or d.get("primary_owner", ""),
+        state=_state_from(d.get("state", ShardState.ACTIVE.value), d.get("id", "")),
+        vector_count=d.get("vector_count", 0),
+        max_vectors=d.get("max_vectors", _DEFAULT_MAX_VECTORS),
+        replicas=list(d.get("replicas", [])),
+        created_at=d.get("created_at", time.time()),
+        version=d.get("version", 1),
+    )
+
 
 class InMemoryEtcd:
-    """Minimal etcd abstraction — thread-safe dict."""
+    """Minimal etcd abstraction — thread-safe dict, optionally JSON-durable."""
 
-    def __init__(self):
+    def __init__(self, path: str | None = None):
         self._data: dict[str, Shard] = {}
+        self._nodes: dict[str, ClusterNode] = {}
+        self._migrations: dict[str, ShardMigration] = {}
         self._lock = threading.RLock()
+        self.path = path
+        if path and os.path.exists(path):
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
+            for k, v in raw.items():
+                if k.startswith(_MIGRATION_KEY_PREFIX):
+                    self._migrations[k[len(_MIGRATION_KEY_PREFIX):]] = _migration_from_dict(v)
+                elif k.startswith(_CLUSTER_KEY_PREFIX):
+                    self._nodes[k[len(_CLUSTER_KEY_PREFIX):]] = _node_from_dict(v)
+                else:
+                    self._data[k] = _shard_from_dict(v)
+        except Exception as e:
+            logger.warning(f"InMemoryEtcd load failed for {self.path}: {e}")
+
+    def _persist(self) -> None:
+        if not self.path:
+            return
+        with self._lock:
+            data = {k: v.to_dict() for k, v in self._data.items()}
+            data.update({f"{_CLUSTER_KEY_PREFIX}{n.node_id}": n.to_dict() for n in self._nodes.values()})
+            data.update({f"{_MIGRATION_KEY_PREFIX}{m.migration_id}": m.to_dict() for m in self._migrations.values()})
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"InMemoryEtcd persist failed for {self.path}: {e}")
 
     def put(self, shard: Shard) -> None:
         with self._lock:
             self._data[shard.id] = shard
+        self._persist()
 
     def get(self, shard_id: str) -> Shard | None:
         with self._lock:
@@ -34,10 +151,51 @@ class InMemoryEtcd:
     def delete(self, shard_id: str) -> None:
         with self._lock:
             self._data.pop(shard_id, None)
+        self._persist()
 
     def all(self) -> list[Shard]:
         with self._lock:
             return list(self._data.values())
+
+    # --- cluster membership (VS-11) -----------------------------------------
+
+    def put_node(self, node: ClusterNode) -> None:
+        with self._lock:
+            self._nodes[node.node_id] = node
+        self._persist()
+
+    def get_node(self, node_id: str) -> ClusterNode | None:
+        with self._lock:
+            return self._nodes.get(node_id)
+
+    def list_nodes(self) -> list[ClusterNode]:
+        with self._lock:
+            return list(self._nodes.values())
+
+    def delete_node(self, node_id: str) -> None:
+        with self._lock:
+            self._nodes.pop(node_id, None)
+        self._persist()
+
+    # --- shard migrations (VS-13 durability) --------------------------------
+
+    def put_migration(self, migration: ShardMigration) -> None:
+        with self._lock:
+            self._migrations[migration.migration_id] = migration
+        self._persist()
+
+    def get_migration(self, migration_id: str) -> ShardMigration | None:
+        with self._lock:
+            return self._migrations.get(migration_id)
+
+    def list_migrations(self) -> list[ShardMigration]:
+        with self._lock:
+            return list(self._migrations.values())
+
+    def delete_migration(self, migration_id: str) -> None:
+        with self._lock:
+            self._migrations.pop(migration_id, None)
+        self._persist()
 
     def watch_prefix(self, prefix: str, callback):
         """No-op for in-mem — caller polls."""
@@ -88,17 +246,18 @@ class Etcd3Store:
         if not val:
             return None
         d = json.loads(val.decode())
-        return Shard(**{k: v for k, v in d.items() if k in Shard.__dataclass_fields__})
+        return _shard_from_dict(d)
 
-    def list_by_namespace(self, namespace: str) -> list[Shard]:
+    def _list_dicts(self) -> list[dict]:
         self._ensure()
         assert self._client is not None
-        out: list[Shard] = []
+        out: list[dict] = []
         for val, _ in self._client.get_prefix("/vsector/shards/"):  # type: ignore
-            d = json.loads(val.decode())
-            if d.get("namespace") == namespace:
-                out.append(Shard(id=d["id"], namespace=d["namespace"], node_id=d.get("node_id", ""), vector_count=d.get("vector_count", 0), max_vectors=d.get("max_vectors", 50_000_000_000)))
+            out.append(json.loads(val.decode()))
         return out
+
+    def list_by_namespace(self, namespace: str) -> list[Shard]:
+        return [s for s in (_shard_from_dict(d) for d in self._list_dicts()) if s.namespace == namespace]
 
     def delete(self, shard_id: str) -> None:
         self._ensure()
@@ -106,13 +265,41 @@ class Etcd3Store:
         self._client.delete(self._key(shard_id))  # type: ignore
 
     def all(self) -> list[Shard]:
+        return [_shard_from_dict(d) for d in self._list_dicts()]
+
+    # --- cluster membership (VS-11) -----------------------------------------
+
+    def _node_key(self, node_id: str) -> str:
+        return f"/vsector/cluster/nodes/{node_id}"
+
+    def _list_node_dicts(self) -> list[dict]:
         self._ensure()
         assert self._client is not None
-        out: list[Shard] = []
-        for val, _ in self._client.get_prefix("/vsector/shards/"):  # type: ignore
-            d = json.loads(val.decode())
-            out.append(Shard(id=d["id"], namespace=d["namespace"], node_id=d.get("node_id", ""), vector_count=d.get("vector_count", 0)))
+        out: list[dict] = []
+        for val, _ in self._client.get_prefix("/vsector/cluster/nodes/"):  # type: ignore
+            out.append(json.loads(val.decode()))
         return out
+
+    def put_node(self, node: ClusterNode) -> None:
+        self._ensure()
+        assert self._client is not None
+        self._client.put(self._node_key(node.node_id), json.dumps(node.to_dict()))  # type: ignore
+
+    def get_node(self, node_id: str) -> ClusterNode | None:
+        self._ensure()
+        assert self._client is not None
+        val, _ = self._client.get(self._node_key(node_id))  # type: ignore
+        if not val:
+            return None
+        return _node_from_dict(json.loads(val.decode()))
+
+    def list_nodes(self) -> list[ClusterNode]:
+        return [_node_from_dict(d) for d in self._list_node_dicts()]
+
+    def delete_node(self, node_id: str) -> None:
+        self._ensure()
+        assert self._client is not None
+        self._client.delete(self._node_key(node_id))  # type: ignore
 
     def watch_prefix(self, prefix: str, callback):
         self._ensure()

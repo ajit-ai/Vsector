@@ -1,42 +1,46 @@
-"""Replication Coordinator & Compaction Service stubs."""
+"""Replication Coordination & Compaction Service.
+
+VS-09.2 removes the simulated ``time.sleep(...) ; return True`` acknowledgement.
+The real application path lives in ``vsector/sharding/replication.py`` and is
+driven directly by the ingest service.  ``ReplicationCoordinator`` is kept as a
+thin backward-compatible shell that delegates to the real transport when one is
+bound, and never fabricates acknowledgements.
+"""
 from __future__ import annotations
 
 import logging
 import threading
-import time
 
 logger = logging.getLogger(__name__)
 
 
 class ReplicationCoordinator:
-    """Quorum-based replication (async, quorum ack). Primary -> 2 followers."""
+    """Thin coordinator over a real replica transport (no fake acknowledgements).
 
-    def __init__(self, replication_factor: int = 3, regions: list[str] | None = None):
+    The active write path uses ``InProcessReplicaTransport`` directly.  This class
+    exists for backward compatibility: it only accepts a transport and forwards
+    operations to it.  Without a transport it refuses to claim success.
+    """
+
+    def __init__(self, replication_factor: int = 3, regions: list[str] | None = None, transport=None):
         self.replication_factor = replication_factor
-        self.followers: list[str] = []
-        # multi-region extension (opt-in via VSECTOR_REGIONS)
-        try:
-            from .multiregion import MultiRegionCoordinator
+        self.regions = regions or []
+        self.transport = transport
+        self.multiregion = None  # type: ignore
 
-            self.multiregion = MultiRegionCoordinator(regions=regions, replication_factor=replication_factor)
-        except Exception:
-            self.multiregion = None  # type: ignore
+    def _require_transport(self):
+        if self.transport is None:
+            raise RuntimeError(
+                "ReplicationCoordinator has no transport; use IngestService.replicator "
+                "(InProcessReplicaTransport) for real replication semantics"
+            )
+        return self.transport
 
-    def replicate_async(self, payload: bytes, followers: list[str] | None = None) -> bool:
-        targets = followers or self.followers[: self.replication_factor - 1]
-        # simulate async quorum ack (always success in single-node)
-        logger.debug(f"Replicating to {targets}")
-        time.sleep(0.001)
-        # also replicate cross-region async best-effort (non-blocking)
-        try:
-            if self.multiregion:
-                import asyncio
+    def replicate_upsert(self, namespace: str, shard, payload: bytes, required_acks: int = 1):
+        return self._require_transport().replicate_upsert(namespace, shard, payload, required_acks=required_acks)
 
-                # namespace unknown here — caller can use multiregion directly for ns-aware ship
-                pass
-        except Exception:
-            pass
-        return True  # quorum ack
+    def replicate_delete(self, namespace: str, shard, payload: bytes, required_acks: int = 1):
+        return self._require_transport().replicate_delete(namespace, shard, payload, required_acks=required_acks)
 
 
 class CompactionService:

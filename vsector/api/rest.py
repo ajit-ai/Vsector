@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import uuid
 import asyncio
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Depends, HTTPException, Response, status
@@ -20,6 +21,8 @@ from ..infra.config import get_settings
 from ..storage.metadata import MetadataStore
 from ..sharding.router import ShardRouter, EtcdStore
 from ..sharding.shard import Shard
+from ..sharding.lifecycle import ShardLifecycleManager
+from ..cluster.membership import ClusterMembershipManager, bootstrap_local_node
 from ..models.namespace import Namespace, DistanceMetric, IndexType, CompressionType
 from ..ingest.service import IngestService
 from ..query.engine import QueryEngine
@@ -30,20 +33,78 @@ from .schemas import NamespaceCreate, UpsertRequest, QueryRequest, FetchRequest,
 cdn = CDN()
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 # singletons for single-node deployment
 metadata_store = MetadataStore(path=f"{settings.data_dir}/metadata.json")
-etcd = EtcdStore()
-router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s)
-ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir)
+etcd = EtcdStore(path=f"{settings.data_dir}/shards.json")
+# VS-11: explicit cluster membership. The LOCAL node is registered at startup
+# (JOINING -> ACTIVE; a persisted ACTIVE/DRAINING/REMOVED state is restored
+# truthfully, never fabricated ACTIVE). No membership is fabricated for other
+# nodes and there is no distributed discovery in VS-11.
+cluster = ClusterMembershipManager(etcd, cluster_id=settings.cluster_id)
+_local_node = bootstrap_local_node(cluster, settings.node_id)
+router = ShardRouter(etcd=etcd, cache_ttl_s=settings.routing_cache_ttl_s, membership=cluster)
+_lifecycle = ShardLifecycleManager(etcd, membership=cluster)
+ingest = IngestService(metadata=metadata_store, router=router, base_dir=settings.data_dir, node_id=settings.node_id)
 query_engine = QueryEngine(metadata=metadata_store, router=router, ingest_service=ingest)
 
-# Hydrate shards from persisted namespaces on startup (fixes metadata.json persistence vs in-memory etcd)
+# Deterministic single-node topology: this node is the primary owner of every shard
+# it hosts; replicas are drawn from the fixed logical node pool (still in-process).
+_NODE_POOL = ("node-0", "node-1", "node-2")
+
+
+def _replica_nodes(node_id: str) -> list[str]:
+    return [n for n in _NODE_POOL if n != node_id]
+
+
+def _make_shard(ns_name: str, index: int) -> Shard:
+    return Shard(
+        id=f"{ns_name}#shard-{index:03d}",
+        namespace=ns_name,
+        node_id=settings.node_id,
+        replicas=_replica_nodes(settings.node_id),
+    )
+
+
+def _ensure_namespace_shards(ns_name: str, shard_count: int) -> None:
+    """Materialize a namespace's shards with a stable identity (CREATING -> ACTIVE).
+
+    Reuses existing durable shards so shard identity, lifecycle state, and primary
+    ownership survive a restart instead of being regenerated with new ids.
+    """
+    if router.etcd.list_by_namespace(ns_name):
+        return
+    for i in range(shard_count):
+        shard = _make_shard(ns_name, i)
+        _lifecycle.create(shard, owner=settings.node_id, replicas=_replica_nodes(settings.node_id))
+        _lifecycle.activate(shard)
+
+
+# Hydrate shards from persisted namespaces on startup (durable shard store +
+# deterministic ids; fixes metadata.json persistence vs in-memory etcd)
 for _ns in metadata_store.list():
-    if not router.etcd.list_by_namespace(_ns.name):
-        for i in range(_ns.shard_count):
-            _shard = Shard(namespace=_ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
-            router.register_shard(_shard)
+    _ensure_namespace_shards(_ns.name, _ns.shard_count)
+
+# Eager startup recovery: create shard contexts so WAL replay + index rebuild run at
+# boot, BEFORE the node is reported ready. Any failure marks recovery as incomplete.
+recovery_status: dict[str, str] = {}
+
+
+def _run_startup_recovery() -> None:
+    for _ns in metadata_store.list():
+        for _shard in router.etcd.list_by_namespace(_ns.name):
+            key = f"{_ns.name}:{_shard.id}"
+            try:
+                _ctx = ingest._get_or_create_ctx(_ns.name, _shard)
+                recovered = _ctx.recovery.recovered_from_wal
+                if recovered:
+                    recovery_status[key] = f"recovered:{recovered}"
+            except Exception as e:  # surfaced via /ready and logs, not silently swallowed
+                logger.error(f"startup recovery failed for {key}: {e}")
+                recovery_status[key] = f"error:{e}"
+
+_run_startup_recovery()
 
 app = FastAPI(
     title="Vsector Vector Database",
@@ -61,7 +122,63 @@ async def health():
 
 @app.get("/ready", tags=["ops"])
 async def ready():
-    return {"ready": True, "namespaces": len(metadata_store.list())}
+    recovery_ok = not any(v.startswith("error:") for v in recovery_status.values())
+    return {"ready": recovery_ok,
+            "namespaces": len(metadata_store.list()),
+            "recovery": recovery_status or "complete"}
+
+# --- cluster membership (VS-11) --- read-only observer/operator visibility
+@app.get("/cluster", tags=["ops"])
+async def cluster_status():
+    return {
+        "cluster_id": cluster.cluster_id,
+        "node_id": settings.node_id,
+        "membership_state": _local_node.state.value,
+        "known_nodes": [n.to_dict() for n in cluster.list()],
+    }
+
+@app.get("/cluster/nodes", tags=["ops"])
+async def cluster_nodes():
+    return [n.to_dict() for n in cluster.list()]
+
+@app.get("/cluster/nodes/{node_id}", tags=["ops"])
+async def cluster_node(node_id: str):
+    node = cluster.get(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail=f"node not found: {node_id}")
+    return node.to_dict()
+
+# --- placement / routing (VS-12) --- read-only operator/observer visibility
+@app.get("/cluster/placement", tags=["ops"])
+async def cluster_placement():
+    namespaces = metadata_store.list()
+    return {
+        "cluster_id": cluster.cluster_id,
+        "local_node_id": settings.node_id,
+        "namespaces": [router.placement_view(ns.name, settings.node_id) for ns in namespaces],
+    }
+
+@app.get(f"{settings.api_prefix}/namespaces/{{namespace}}/placement", tags=["namespaces"])
+async def namespace_placement(namespace: str):
+    ns = metadata_store.get(namespace)
+    if not ns:
+        raise HTTPException(status_code=404, detail="namespace not found")
+    view = router.placement_view(namespace, settings.node_id)
+    view["dimension"] = ns.dimension
+    view["shard_count"] = len(view["shards"])
+    return view
+
+@app.get(f"{settings.api_prefix}/namespaces/{{namespace}}/shards", tags=["namespaces"])
+async def namespace_shards(namespace: str):
+    ns = metadata_store.get(namespace)
+    if not ns:
+        raise HTTPException(status_code=404, detail="namespace not found")
+    view = router.placement_view(namespace, settings.node_id)
+    return {
+        "namespace": namespace,
+        "local_node_id": settings.node_id,
+        "shards": view["shards"],
+    }
 
 @app.get("/metrics", tags=["ops"])
 async def metrics():
@@ -90,11 +207,8 @@ async def create_namespace(body: NamespaceCreate, _auth=Depends(verify_api_key))
         metadata_store.create(ns)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    # create shards (HRW ring seeds)
-    for i in range(ns.shard_count):
-        shard = Shard(namespace=ns.name, node_id=f"node-{i % 3}", replicas=[f"node-{(i+1)%3}", f"node-{(i+2)%3}"])
-        # vary shard count distribution: use consistent hash
-        router.register_shard(shard)
+    # create shards with stable deterministic identity, this node as primary owner
+    _ensure_namespace_shards(ns.name, ns.shard_count)
     return ns.model_dump(mode="json")
 
 @app.delete(f"{settings.api_prefix}/namespaces/{{name}}", tags=["namespaces"])

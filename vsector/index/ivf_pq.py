@@ -30,6 +30,9 @@ class IVFPQIndex(BaseIndex):
         self._fallback = FlatIndex(dimension, metric)
         self._trained = False
         self._faiss_index = None
+        self.degraded = False
+        self.backend_name = "FlatIndex"
+        self.is_native_backend = False
         self._ids: list[str] = []
         self._id_to_idx: dict[str, int] = {}
         self._metadatas: list[dict] = []
@@ -42,9 +45,19 @@ class IVFPQIndex(BaseIndex):
                 if metric == "cosine":
                     faiss.normalize_L2  # type: ignore
                 logger.info(f"FAISS IVF-PQ initialized dim={dimension} nlist={nlist} m={self.m}")
+                self.backend_name = "FAISS"
+                self.is_native_backend = True
             except Exception as e:
                 logger.warning(f"FAISS init failed, fallback to flat: {e}")
                 self._faiss_index = None
+                self.degraded = True
+                self.backend_name = "FlatIndex"
+                self.is_native_backend = False
+        else:
+            logger.warning("faiss not installed - using FlatIndex fallback for IVF_PQ")
+            self.degraded = True
+            self.backend_name = "FlatIndex"
+            self.is_native_backend = False
 
     def train(self, sample_vectors: np.ndarray):
         if self._faiss_index is None:
