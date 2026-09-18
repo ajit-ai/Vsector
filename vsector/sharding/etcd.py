@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from ..cluster.node import ClusterNode, NodeMembershipState
+from .migration import MigrationState, ShardMigration
 from .shard import Shard, ShardState
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,34 @@ _DEFAULT_MAX_VECTORS = 50_000_000_000
 
 # Reserved key prefix for cluster membership records inside the shard store.
 _CLUSTER_KEY_PREFIX = "cluster::node::"
+
+# Reserved key prefix for durable shard-migration records (VS-13), same store.
+_MIGRATION_KEY_PREFIX = "migration::"
+
+
+def _migration_from_dict(d: dict) -> ShardMigration:
+    try:
+        state = MigrationState(str(d.get("state", MigrationState.PENDING.value)))
+    except ValueError:
+        logger.warning(f"migration {d.get('migration_id', '?')}: unknown persisted state {d.get('state')!r}; defaulting to PENDING")
+        state = MigrationState.PENDING
+    return ShardMigration(
+        migration_id=d.get("migration_id", ""),
+        namespace=d.get("namespace", ""),
+        shard_id=d.get("shard_id", ""),
+        source_node_id=d.get("source_node_id", ""),
+        target_node_id=d.get("target_node_id", ""),
+        state=state,
+        source_version=int(d.get("source_version", 1)),
+        cluster_id=d.get("cluster_id", "vsector-cluster-default"),
+        created_at=float(d.get("created_at", 0.0)),
+        updated_at=float(d.get("updated_at", 0.0)),
+        error=d.get("error"),
+        version=int(d.get("version", 1)),
+        source_digest=d.get("source_digest"),
+        target_digest=d.get("target_digest"),
+        finalized=bool(d.get("finalized", False)),
+    )
 
 
 def _node_from_dict(d: dict) -> ClusterNode:
@@ -74,6 +103,7 @@ class InMemoryEtcd:
     def __init__(self, path: str | None = None):
         self._data: dict[str, Shard] = {}
         self._nodes: dict[str, ClusterNode] = {}
+        self._migrations: dict[str, ShardMigration] = {}
         self._lock = threading.RLock()
         self.path = path
         if path and os.path.exists(path):
@@ -83,7 +113,9 @@ class InMemoryEtcd:
         try:
             raw = json.loads(Path(self.path).read_text(encoding="utf-8"))
             for k, v in raw.items():
-                if k.startswith(_CLUSTER_KEY_PREFIX):
+                if k.startswith(_MIGRATION_KEY_PREFIX):
+                    self._migrations[k[len(_MIGRATION_KEY_PREFIX):]] = _migration_from_dict(v)
+                elif k.startswith(_CLUSTER_KEY_PREFIX):
                     self._nodes[k[len(_CLUSTER_KEY_PREFIX):]] = _node_from_dict(v)
                 else:
                     self._data[k] = _shard_from_dict(v)
@@ -96,6 +128,7 @@ class InMemoryEtcd:
         with self._lock:
             data = {k: v.to_dict() for k, v in self._data.items()}
             data.update({f"{_CLUSTER_KEY_PREFIX}{n.node_id}": n.to_dict() for n in self._nodes.values()})
+            data.update({f"{_MIGRATION_KEY_PREFIX}{m.migration_id}": m.to_dict() for m in self._migrations.values()})
         try:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             Path(self.path).write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -142,6 +175,26 @@ class InMemoryEtcd:
     def delete_node(self, node_id: str) -> None:
         with self._lock:
             self._nodes.pop(node_id, None)
+        self._persist()
+
+    # --- shard migrations (VS-13 durability) --------------------------------
+
+    def put_migration(self, migration: ShardMigration) -> None:
+        with self._lock:
+            self._migrations[migration.migration_id] = migration
+        self._persist()
+
+    def get_migration(self, migration_id: str) -> ShardMigration | None:
+        with self._lock:
+            return self._migrations.get(migration_id)
+
+    def list_migrations(self) -> list[ShardMigration]:
+        with self._lock:
+            return list(self._migrations.values())
+
+    def delete_migration(self, migration_id: str) -> None:
+        with self._lock:
+            self._migrations.pop(migration_id, None)
         self._persist()
 
     def watch_prefix(self, prefix: str, callback):
