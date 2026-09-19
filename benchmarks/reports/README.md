@@ -1,4 +1,4 @@
-# Benchmark Report — Vsector v0.7.0
+# Benchmark Report â€” Vsector v0.7.0
 
 Generated: 2026-08-30 23:41
 
