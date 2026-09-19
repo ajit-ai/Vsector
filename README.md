@@ -184,22 +184,22 @@ Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_qu
 ## Documentation (GitHub Pages)
 
 The docs site lives at **https://ajit-ai.github.io/Vsector/** and is rebuilt
-automatically on every push to `main` by `.github/workflows/cd.yml`
-(`python docs/gen.py` → `docs/_site` → Pages deploy). Pages must be enabled in
+automatically on every push to `main` by `.github/workflows/docs.yml`
+(RST → Sphinx → `docs/_build/html` → Pages deploy). Pages must be enabled in
 repo settings with **Deploy from a branch: GitHub Actions**.
 
-- Source of truth: `README.md` + `docs/*.md` (`ARCHITECTURE.md`, `ROADMAP.md`)
-- Static generator: `docs/gen.py` (stdlib-only, deterministic output)
-- Local preview:
+- Source of truth: `docs/*.rst` (`index.rst`, `architecture.rst`, `roadmap.rst`)
+- Build: Sphinx (`docs/conf.py`, `-W` = warnings treated as errors)
+- Local build & preview:
 
 ```bash
-python docs/gen.py
-python -m http.server 8080 --directory docs/_site   # http://localhost:8080
+python -m pip install sphinx
+sphinx-build -W -b html docs docs/_build/html
+python -m http.server 8080 --directory docs/_build/html   # http://localhost:8080
 ```
 
-- CI gate: `.github/workflows/ci.yml` runs `python docs/gen.py --check`, which
-  fails the build if `docs/_site` has drifted from the source docs (run
-  `python docs/gen.py` and commit the regenerated site).
+- CI gate: `.github/workflows/ci.yml` runs the Sphinx build with `-W`; the
+  generated site is never committed to the repo.
 
 ## Distributed Capabilities Implemented vs Not Implemented
 
@@ -209,7 +209,7 @@ Not implemented (future: VS-15 and later): Raft/Paxos consensus, leader election
 
 ## Roadmap / Production Hardening
 
-See `docs/ROADMAP.md` (milestones VS-15 → GA 1.0 with a timeline) and `docs/ARCHITECTURE.md` (present vs target architecture and capability coverage).
+See `docs/roadmap.rst` (milestones VS-15 → GA 1.0 with a timeline) and `docs/architecture.rst` (present vs target architecture and capability coverage).
 
 - VS-15 — Real-etcd metadata spine (default, with liveness leases)
 - VS-16 — Data-plane RPC transport (executable `REMOTE` routing)

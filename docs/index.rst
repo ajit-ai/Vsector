@@ -1,0 +1,422 @@
+Vsector — Trillion-Scale Distributed Vector Database
+====================================================
+
+.. image:: https://img.shields.io/badge/License-MIT-yellow.svg
+   :target: ../LICENSE
+.. image:: https://img.shields.io/badge/python-3.10+-blue.svg
+   :target: ../pyproject.toml
+
+.. epigraph::
+
+   Production-grade, distributed vector DB capable of storing & querying **trillions of
+   high-dimensional vectors** with **low-latency ANN** at massive scale. Built for AI
+   coding tools, RAG, and semantic search.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Documentation
+
+   architecture
+   roadmap
+
+Objective
+---------
+
+* Storing & querying trillions of high-dimensional vector records
+* Serving low-latency **ANN (HNSW / IVF-PQ / ScaNN)** searches
+* Communicating with external systems via **REST, gRPC, GraphQL, WebSocket, Kafka**
+* Supporting **multi-tenancy, RBAC, observability, disaster recovery**
+* SOLID, 12-factor, horizontally scalable, cloud-native
+
+Architecture (Layered Microservices)
+------------------------------------
+
+.. code-block:: text
+
+   Client / External Systems  →  REST | gRPC | GraphQL | WebSocket | Kafka Consumer
+            ↓
+   API Gateway Layer          →  Rate Limiting | Auth (JWT/OAuth2) | LB | Routing | Circuit Breaker | Versioning
+            ↓
+   Core Service Layer         →  Ingest Service | Query Service | Index Manager | Namespace Manager | Replication Coordinator | Compaction Service
+            ↓
+   Storage Engine Layer       →  HNSW/IVF-PQ/ScaNN Shards (10-50B vectors, 3x repl) | WAL | Segment Store (Tiered) | Metadata Store (PostgreSQL → JSON)
+            ↓
+   Infrastructure & Platform  →  Kubernetes | S3 | CDN/DNS | Prometheus/Grafana/Jaeger/ELK
+
+See ``deploy/k8s/deployment.yaml`` for K8s + HPA.
+
+Quickstart
+----------
+
+.. code-block:: bash
+
+   pip install -e .          # or pip install -e .[dev,ann]
+   vsector serve --reload     # REST http://localhost:8080  gRPC :50051
+   # another shell
+   python examples/quickstart.py
+
+REST example
+~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8080/v1/namespaces -H "X-API-Key: test-key" \
+     -H "Content-Type: application/json" -d '{"name":"products","dimension":1536,"index_type":"HNSW"}'
+
+   curl -X POST http://localhost:8080/v1/vectors/upsert -H "X-API-Key: test-key" \
+     -d '{"namespace":"products","vectors":[{"vector":[0.1,0.2,...],"metadata":{"category":"books"}}]}'
+
+   curl -X POST http://localhost:8080/v1/vectors/query -H "X-API-Key: test-key" \
+     -d '{"namespace":"products","vector":[0.1,0.2,...],"top_k":10,"filters":{"category":{"$eq":"books"}}}'
+
+Python SDK
+~~~~~~~~~~
+
+.. code-block:: python
+
+   from vsector.api.sdk import VsectorClient
+
+   client = VsectorClient(api_key="test-key")
+   client.create_namespace("demo", dimension=1536)
+   client.upsert("demo", [{"vector": [...], "metadata": {"k": "v"}}])
+   res = client.query("demo", vector=[...], top_k=10)
+
+Module-by-Module Spec
+---------------------
+
+Module 1: Data Model & Schema — ``vsector/models/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   class VectorRecord:
+       id: UUID; namespace: str; vector: List[float]; dimension: int
+       metadata: Dict[str, Any]; created_at, updated_at, version:int
+       ttl: Optional[datetime]; tags: List[str]; source_system:str; checksum:str
+
+   class Namespace:
+       name, dimension, distance_metric{COSINE,EUCLIDEAN,DOT_PRODUCT,MANHATTAN}
+       index_type{HNSW,IVF_PQ,FLAT,SCANN}, replication_factor(default 3), shard_count, compression{NONE,PQ,SQ8,BF16}
+
+Module 2: Distributed Sharding — ``vsector/sharding/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* **Rendezvous Hashing (HRW)** for ``shard_key = hash(namespace+record_id)``, 256 vnodes/node
+* Hot-shard detection, auto-split at 50B vectors
+* Shard metadata in etcd (``EtcdStore`` abstraction), routing table cached 5s + gossip invalidation + fallback
+* Zero-downtime split: lock WAL → copy halves → atomic routing update in etcd → drain WAL → retire parent
+
+**Shard lifecycle & ownership (VS-10)** — every shard has an explicit, observable
+lifecycle ``CREATING → ACTIVE → DRAINING → OFFLINE`` (plus the explicit
+ownership-change path ``ACTIVE → DRAINING → (owner change) → ACTIVE``). Transitions
+are validated (``Shard.transition`` / ``ShardLifecycleManager``); arbitrary state
+jumps raise a deterministic ``InvalidLifecycleTransitionError`` and never leave a
+half-applied state. Ownership is the existing node identity: ``shard.node_id`` is the
+**primary owner** (exposed as ``primary_owner``) and ``shard.replicas`` is the
+distinct replica membership — a configured replica can be unhealthy (VS-09 health
+stays authoritative), a healthy replica never auto-promotes, an unhealthy primary
+keeps its ownership, and automatic failover/consensus/live migration are **not**
+implemented. Routing is ownership- and lifecycle-aware: writes resolve
+``namespace → shard → current primary owner`` and are refused with a deterministic
+error (``ShardCreatingError``, ``ShardDrainingError``, ``ShardOfflineError``,
+``NoPrimaryOwnerError``, ``OwnershipMismatchError``) rather than being silently
+forwarded to a non-primary node or a different shard; reads fan out only over
+readable (``ACTIVE``/``DRAINING``) shards. Ownership/lifecycle state is observable
+and JSON-serializable via ``Shard.ownership()``, shard ``to_dict()`` (``state``,
+``primary_owner``, ``replicas``) in ``GET /namespaces/{name}/stats``, and per-shard
+in ``ingest.stats()`` (``shard_state``, ``primary_owner``, ``replicas``); all
+returned structures are deterministic fresh copies. Stable node identity is a
+configured string (``VSECTOR_NODE_ID``, default ``node-0``), never an object memory
+address.
+
+**Persistence & restart (VS-10)** — when the shard store is durable
+(``EtcdStore(path=...)``), shard **identity is stable across restart** (deterministic
+ids instead of regenerated uuids), and persisted lifecycle state + primary owner are
+reconstructed truthfully: a ``DRAINING``/``OFFLINE`` shard is never fabricated
+``ACTIVE`` by a restart. Without a durable shard store, no shard metadata survives a
+restart and the process boots a fresh ``ACTIVE`` topology (honest: it makes no claim
+about prior state).
+
+Module 2b: Cluster Membership & Ownership Integration — ``vsector/cluster/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Cluster identity & node identity (VS-11)** — a deployment has a stable
+``cluster_id`` (``VSECTOR_CLUSTER_ID``, deterministic default
+``vsector-cluster-default``, never regenerated per restart) and each node has a
+stable ``node_id`` (``VSECTOR_NODE_ID``, reused unchanged from VS-10 for shard
+ownership). ``cluster_id``, ``node_id``, and ``shard_id`` are three distinct
+identities and are never conflated. A ``ClusterNode`` record minimally carries
+``node_id``, ``cluster_id``, ``membership_state``, and a transition ``version``.
+
+**Membership lifecycle (VS-11)** — explicit states
+``JOINING → ACTIVE → DRAINING → REMOVED`` with validated transitions:
+``JOINING → {ACTIVE, REMOVED}``, ``ACTIVE → {DRAINING, REMOVED}``,
+``DRAINING → {ACTIVE, REMOVED}``, ``REMOVED`` terminal. All transitions go through
+``ClusterNode.transition`` / ``ClusterMembershipManager``; arbitrary jumps raise a
+deterministic ``InvalidMembershipTransitionError`` and never silently change state.
+Duplicate registration raises ``DuplicateNodeRegistrationError``; unknown nodes
+raise ``UnknownNodeError``; a removed node raises ``RemovedNodeError`` (still
+*known*, just no longer a member). Persistence reuses the same etcd abstraction as
+shards (one coherent metadata model — cluster nodes live under a reserved prefix in
+the durable store).
+
+**Local node startup (VS-11)** — on server start the local node is registered
+``JOINING → ACTIVE``. A persisted ``ACTIVE`` local node is restored as ``ACTIVE``; a
+persisted ``DRAINING``/``REMOVED`` state is restored truthfully (a restart never
+fabricates ``ACTIVE`` membership). Membership is never fabricated for arbitrary
+nodes, and there is **no distributed discovery** in VS-11.
+
+**Ownership validation against membership (VS-11)** — VS-10's ownership remains
+authoritative (``shard.node_id`` is the primary owner, ``shard.replicas`` the
+replica membership; no second representation). VS-11 validates it: a shard whose
+primary owner is not a known, non-removed cluster member raises a deterministic
+``UnknownNodeError``/``RemovedNodeError`` during routing (``ShardRouter.route``/
+``route_write``) and lifecycle operations (``ShardLifecycleManager.create``,
+``change_owner`` — new owners must be known members, and the VS-10 ``DRAINING``
+requirement is preserved). No shard is silently adopted, rerouted, migrated, or
+transferred. Replica validation is exposed as an explicit operation
+(``ClusterMembershipManager.validate_replicas``) used where a control-plane
+operation requires it.
+
+**Membership is NOT health (VS-11)** — cluster membership state is a separate axis
+from VS-09 replication health: a node can be ``ACTIVE`` membership while a replica
+is unhealthy, and ``DRAINING`` membership does not automatically drain its shards or
+promote anyone. Membership never auto-changes shard lifecycle, replication
+readiness, or ownership.
+
+**Observability (VS-11)** — read-only endpoints ``GET /cluster`` (``cluster_id``,
+local ``node_id``, ``membership_state``, ``known_nodes``), ``GET /cluster/nodes``,
+and ``GET /cluster/nodes/{node_id}``; node records are deterministic fresh copies.
+
+**Restart truthfulness (VS-11)** — cluster identity, node identity, membership
+state, shard ownership, and shard lifecycle persist and are restored consistently;
+replication health remains runtime-derived. Nothing is fabricated after restart: no
+healthy replicas, no successful deliveries, no automatic ownership transfer, no
+automatic failover.
+
+Module 2c: Placement & Local/Remote Routing Decisions — ``vsector/sharding/placement.py``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Deterministic placement (VS-12)** — every record maps to exactly one shard by HRW
+over the authoritative, persisted shard set (never manufactured by the router). A
+shard with no owner, an unknown owner, or a removed owner yields a deterministic
+decision, not a silent adoption/reroute. Placement is stable across restarts and
+identical from any node that shares the same metadata.
+
+**Explicit routing decisions (VS-12)** — ``place()``, ``route_read_decision()``,
+``route_write_decision()``, and ``query_route()`` return an immutable
+``RoutingDecision`` answering four questions: *which shard*, *who owns it*, *is the
+owner a known member*, and *LOCAL / REMOTE / UNAVAILABLE* relative to the local
+node. ``LOCAL`` means the owner is this node (process the request here), ``REMOTE``
+means the owner is another known node (a decision *only* — see non-goals), and
+``UNAVAILABLE`` carries a deterministic, user-actionable ``reason`` (non-writable
+lifecycle state, no primary owner, owner not a cluster member, owner removed). The
+existing VS-10 ``route_write`` gate is preserved: a ``REMOTE`` decision never
+triggers a local write, and ``IngestService`` never fabricates local success.
+
+**Lifecycle/membership-aware (VS-12)** — read decisions require readable states
+(``ACTIVE``/``DRAINING``); write decisions require ``ACTIVE`` (a ``DRAINING`` shard
+is never silently writable). The owner is validated against VS-11 membership:
+unknown owners and removed owners make the decision ``UNAVAILABLE`` without
+transferring ownership, promoting replicas, or mutating any metadata. Routing is
+side-effect free — decisions never change shard state, versions, ownership,
+membership, or persisted files.
+
+**Observability (VS-12)** — read-only operator endpoints ``GET /cluster/placement``
+(cluster-wide), ``GET /v1/namespaces/{namespace}/placement``, and
+``GET /v1/namespaces/{namespace}/shards``, returning fresh-copy placement metadata
+(``state``, ``primary_owner``, ``replicas``, ``owner_membership_state``,
+``route_type``, ``target``, ``reason``). Unknown namespaces return 404; failed
+placements/decisions map to 400 via ``PlacementError``/``RoutingError``.
+
+Module 3: Vector Index Engine — ``vsector/index/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* **HNSW**: M 16-64, efConstruction 200-500, efSearch 50-200, maxLevel auto ``log(n)/log(M)``, flat int32 adjacency, mmap files, level-0 NVMe, incremental build
+* **IVF-PQ**: nlist 4096-65536, nprobe 64-256, subspaces ``dim/8``, 256 codes (8-bit), train on 1M samples, shared-mem codebook, 24h retrain. Uses FAISS if available else flat simulation.
+* **Lifecycle**: ``BUILDING → READY → DEGRADED → COMPACTING → READY`` with triggers delete_ratio>10%, fragmentation>0.3, every 6h
+
+Module 4: Write Path — ``vsector/ingest/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Client → Gateway → Ingest (schema+auth) → WAL (GROUP_COMMIT 1000/5ms, fsync) → Shard Router (HRW, lifecycle/ownership-aware) → Primary Shard → MemTable → async replicate 2 followers (quorum ack) → ACK → Background MemTable→SSTable flush → SSTable→Index merge
+
+WAL binary ``[len:4B][checksum:4B][ts:8B][payload:NB]``, segmented 256MB, 7-day
+retention. Batch 10k, async job_id+webhook, idempotency_key. Writes are routed only
+to ``ACTIVE`` shards whose primary owner is the local node;
+``CREATING``/``DRAINING``/``OFFLINE`` or non-owned shards return a deterministic
+error instead of a fabricated success.
+
+**Replication health & readiness** — writes are applied to independently represented
+in-process replica state (WAL + SegmentStore + index); ack reflects the actual
+result, never a simulation. A shard is **ready** when the primary is available AND
+``1 + healthy_replicas >= required_acks`` can currently be satisfied; **degraded**
+means at least one configured replica is unhealthy/unavailable (independent of ready
+— ``required_acks = 1`` with a down replica is degraded-but-ready). A replica is
+**healthy** when it has no currently known replication failure; **unavailable** is
+its current fault state (distinct from historical health). Health only clears after
+a real subsequent successful delivery (``heal`` alone — or a restart — never
+fabricates recovery). Per-replica observability includes last-success/last-failure
+timestamps, success/failure counters, and a stable error summary (``Type: message``,
+no object addresses/tracebacks). Health is exposed additively in write responses
+(``replication.health``, single object per touched shard or ``{"shards": {...}}``
+for multi-shard), per shard in ``GET /metrics`` (gauges
+``vsector_replication_healthy_replicas``, ``vsector_replication_ready`` — both
+derived from the same ``replication_health()`` calculation as ``stats()``), and via
+``replication_health()`` on the transport; inspection is read-only and idempotent —
+it never mutates WAL/replica state, never invokes the endpoint provider, and never
+performs writes.
+
+Module 5: Read Path — ``vsector/query/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Query Service → validate dim → pre-filter (Bloom+inverted) → fan-out parallel async to shards → per-shard ANN ef_search → post-filter → top-K local → merge global top-K → re-rank (cross-encoder/MMR stub) → return
+
+Schema supports ``filters, ef_search, include_metadata/vector, consistency
+EVENTUAL|STRONG, timeout_ms 200``. Target P99 <50ms @1M, <200ms @1T.
+
+Module 6: External System Layer — ``vsector/api/`` + ``vsector/gateway/``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* **6A REST** ``Base /v1`` OpenAPI 3.1: ``POST/DELETE/GET /namespaces*``, ``POST /vectors/upsert|query|fetch|delete``, ``PATCH /vectors/{id}/metadata``, ``GET /vectors/{id}``, ``GET /health|/ready|/metrics`` — Auth API-Key/JWT/mTLS, rate limit 10k rps, headers ``X-RateLimit-*``
+* **6B gRPC** ``proto/vsector.proto`` → ``VectorDBService`` with Upsert (client stream), Query, BatchQuery (bidi), Delete, Fetch, WatchNamespace (server stream), gRPC-Web, reflection, deadline propagation
+* **6C Kafka** ``vsector.api.events.EventBus`` with ``AIOKafkaProducer/Consumer``, topics ``vsector.<ns>.<event>``, group consumer → IngestService
+
+Project Layout
+--------------
+
+.. code-block:: text
+
+   vsector/
+     models/       # VectorRecord, Namespace
+     sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator, Placement/RoutingDecision (VS-12)
+     cluster/      # ClusterMembershipManager, ClusterNode, membership lifecycle (VS-11)
+     index/        # BaseIndex, Flat, HNSW, IVF-PQ, lifecycle, factory
+     storage/      # WAL, SegmentStore (MemTable/SSTable tiered), MetadataStore
+     ingest/       # IngestService (write path)
+     query/        # QueryEngine (read path)
+     api/          # rest.py (FastAPI), grpc_server.py, events.py (Kafka), sdk.py, websocket.py, schemas.py
+     gateway/      # auth.py (JWT/API-Key/rate limit/circuit breaker)
+     infra/        # config.py (12-factor), logging.py, metrics.py
+   deploy/k8s/     # deployment.yaml (HPA 3-20), configmap.yaml
+   examples/       # quickstart.py, client_example.py
+   tests/          # test_*.py
+   proto/vsector.proto
+
+Configuration (12-factor via env ``VSECTOR_*``)
+-----------------------------------------------
+
+See ``.env.example`` and ``vsector/infra/config.py``. Key vars:
+``VSECTOR_DATA_DIR``, ``VSECTOR_NODE_ID`` (stable local node identity for shard
+ownership), ``VSECTOR_CLUSTER_ID`` (stable cluster identity),
+``VSECTOR_KAFKA_BOOTSTRAP_SERVERS``, ``VSECTOR_ETCD_ENDPOINTS``,
+``VSECTOR_RATE_LIMIT_RPS``, ``VSECTOR_SHARD_MAX_VECTORS``,
+``VSECTOR_WAL_SEGMENT_BYTES``, etc.
+
+Observability
+-------------
+
+* Prometheus ``/metrics`` (ingest_total, query_total/latency, index_vectors, wal_bytes)
+* Grafana dashboards (``deploy/grafana/``)
+* Jaeger tracing stub (``OTEL_ENDPOINT``), ELK logging
+
+Deploy
+------
+
+.. code-block:: bash
+
+   docker build -t vsector:0.1.0 .
+   docker-compose up --build   # vsector + kafka + etcd + prometheus + grafana
+   kubectl apply -f deploy/k8s/
+
+Development
+-----------
+
+.. code-block:: bash
+
+   make install   # pip install -e .[dev]
+   make proto     # regenerate gRPC stubs
+   make test      # pytest
+   make lint      # ruff check
+   make run       # vsector serve --reload
+
+Tests: ``tests/test_models.py`` ``test_sharding.py`` ``test_index.py``
+``test_ingest_query.py`` ``test_api.py`` ``test_shard_lifecycle.py``
+``test_cluster_membership.py`` ``test_placement_routing.py``
+
+Documentation
+-------------
+
+The documentation is authored in **RST** and built with **Sphinx**. Source of truth
+is the ``docs/*.rst`` tree (``index.rst``, ``architecture.rst``, ``roadmap.rst``),
+configured by ``docs/conf.py``.
+
+* Sphinx build (warnings as errors):
+
+  .. code-block:: bash
+
+     python -m pip install sphinx
+     sphinx-build -W -b html docs docs/_build/html
+
+* Local preview:
+
+  .. code-block:: bash
+
+     python -m http.server 8080 --directory docs/_build/html   # http://localhost:8080
+
+* CI gate: ``.github/workflows/ci.yml`` runs the Sphinx build with ``-W`` (warnings
+  treated as errors); the generated site is never committed.
+* The docs site is rebuilt and deployed to GitHub Pages on every push to ``main`` by
+  ``.github/workflows/docs.yml`` (Pages source must be **GitHub Actions**).
+
+Distributed Capabilities Implemented vs Not Implemented
+-------------------------------------------------------
+
+Implemented (VS-10 → VS-14): explicit shard lifecycle
+(``CREATING → ACTIVE → DRAINING → OFFLINE``), primary-owner/replica ownership,
+ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable
+cluster identity, explicit node membership lifecycle
+(``JOINING → ACTIVE → DRAINING → REMOVED``), membership persistence,
+ownership/replica validation against known membership, deterministic cluster
+APIs/observability (``GET /cluster*``), truthful restart behavior, deterministic
+record → shard placement, explicit local-owner/remote-owned routing decisions
+(``LOCAL``/``REMOTE``/``UNAVAILABLE``), membership-aware owner validation in
+decisions, lifecycle-aware read/write/query decisions, read-only placement
+observability (``GET /cluster/placement``, ``GET /v1/namespaces/{ns}/placement|shards``),
+side-effect-free routing, explicit validated shard-migration lifecycle
+(``PENDING → … → COMPLETED``) with SHA-256-verified real data movement over
+per-node storage roots (VS-13), and durable migration CRUD on the shared metadata
+store with a read-only ``recommend_rebalance()`` recommendation (VS-14).
+
+Not implemented (future: VS-15 and later): Raft/Paxos consensus, leader election,
+automatic failover, automatic shard migration (networked), automatic rebalancing,
+cross-node transport / distributed RPC, distributed service discovery, background
+health probing, automatic replica promotion, distributed result merging. A
+``REMOTE`` routing decision is a decision only — no cross-node transport is
+executed. Membership state and health never masquerade as these capabilities.
+
+Roadmap / Production Hardening
+------------------------------
+
+See :doc:`roadmap` (milestones VS-15 → GA 1.0 with a timeline) and :doc:`architecture`
+(present vs target architecture and capability coverage).
+
+* VS-15 — Real-etcd metadata spine (default, with liveness leases)
+* VS-16 — Data-plane RPC transport (executable ``REMOTE`` routing)
+* VS-17 — Control-plane linearization (Raft for ownership/migration/membership commits)
+* VS-18/19 — Replica promotion + failover, active health probing
+* VS-20/21 — Automatic rebalancing scheduler, distributed query fan-out + merge
+* VS-22 — Replace ``MetadataStore`` JSON with PostgreSQL + migrations
+* VS-23 — S3 tier for cold SSTables, CDC + disaster recovery
+* VS-24/25 — Multi-tenancy isolation, per-namespace RBAC, mTLS for inter-service
+* VS-26/27 — ScaNN index, BF16/SQ8 quantization, full re-ranking with cross-encoder
+* VS-28/29 — Scale-out validation (p99 <50ms @1M, <200ms @1T) and GA certification
+
+License
+-------
+
+MIT — see the `LICENSE <https://github.com/ajit-ai/Vsector/blob/main/LICENSE>`_ file.
