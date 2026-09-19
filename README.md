@@ -181,6 +181,26 @@ make run       # vsector serve --reload
 
 Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_query.py` `test_api.py` `test_shard_lifecycle.py` `test_cluster_membership.py` `test_placement_routing.py`
 
+## Documentation (GitHub Pages)
+
+The docs site lives at **https://ajit-ai.github.io/Vsector/** and is rebuilt
+automatically on every push to `main` by `.github/workflows/cd.yml`
+(`python docs/gen.py` → `docs/_site` → Pages deploy). Pages must be enabled in
+repo settings with **Deploy from a branch: GitHub Actions**.
+
+- Source of truth: `README.md` + `docs/*.md` (`ARCHITECTURE.md`, `ROADMAP.md`)
+- Static generator: `docs/gen.py` (stdlib-only, deterministic output)
+- Local preview:
+
+```bash
+python docs/gen.py
+python -m http.server 8080 --directory docs/_site   # http://localhost:8080
+```
+
+- CI gate: `.github/workflows/ci.yml` runs `python docs/gen.py --check`, which
+  fails the build if `docs/_site` has drifted from the source docs (run
+  `python docs/gen.py` and commit the regenerated site).
+
 ## Distributed Capabilities Implemented vs Not Implemented
 
 Implemented (VS-10 → VS-14): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing, explicit validated shard-migration lifecycle (`PENDING → … → COMPLETED`) with SHA-256-verified real data movement over per-node storage roots (VS-13), and durable migration CRUD on the shared metadata store with a read-only `recommend_rebalance()` recommendation (VS-14).

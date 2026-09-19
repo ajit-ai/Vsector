@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -28,7 +29,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

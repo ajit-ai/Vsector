@@ -81,6 +81,21 @@ jobs:
           pip install -e .
           python -c "from vsector.models.cost import auto_shard_count, estimate_cost; print(auto_shard_count(2000000000,1536)); print(estimate_cost(1000000,1536,'SQ8'))"
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Build docs site and verify determinism
+        run: |
+          python docs/gen.py
+          test -f docs/_site/index.html
+          test -f docs/_site/architecture.html
+          test -f docs/_site/roadmap.html
+          python docs/gen.py --check
+          echo "docs build OK (regenerable, deterministic)"
+
   benchmark:
     runs-on: ubuntu-latest
     needs: test

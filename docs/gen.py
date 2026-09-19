@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -117,7 +118,7 @@ def _md_to_html(text: str) -> str:
     return "\n".join(out)
 
 
-def build() -> None:
+def _build() -> None:
     SITE.mkdir(parents=True, exist_ok=True)
     readme_title = "README"
     readme_html = _md_to_html(README.read_text(encoding="utf-8"))
@@ -135,5 +136,40 @@ def build() -> None:
     print(f"Built {len(list(SITE.iterdir()))} files in docs/_site")
 
 
+def build() -> None:
+    """Public alias: always regenerate docs/_site from source."""
+    _build()
+
+
+def check() -> None:
+    """Verify committed docs/_site matches a fresh build (no drift).
+
+    Used by CI so a PR that changes docs/*.md or README.md without
+    regenerating the site fails loudly instead of silently publishing stale
+    artifacts.
+    """
+    import hashlib
+
+    def snap() -> dict[str, str]:
+        return {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(SITE.glob("*.html"))
+        }
+
+    before = snap()
+    _build()
+    after = snap()
+    if before != after:
+        missing = sorted(set(after) - set(before))
+        changed = sorted(k for k in after if before.get(k) != after[k])
+        print(f"docs/_site is OUT OF DATE: missing={missing} changed={changed}")
+        print("run `python docs/gen.py` and commit the regenerated docs/_site")
+        sys.exit(1)
+    print("docs/_site is current (deterministic, no drift)")
+
+
 if __name__ == "__main__":
-    build()
+    if len(sys.argv) > 1 and sys.argv[1] == "--check":
+        check()
+    else:
+        _build()
