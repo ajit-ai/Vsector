@@ -21,7 +21,7 @@ footer{color:#57606a;font-size:13px;padding:24px 32px}
 </head>
 <body>
 <header><strong>Vsector</strong> — vector sharding cluster ·
-<a href="./">README</a> · <a href="roadmap.html">ROADMAP</a></header>
+<a href="./">README</a> · <a href="architecture.html">ARCHITECTURE</a> · <a href="roadmap.html">ROADMAP</a></header>
 <main>
 <h1>Vsector — Trillion-Scale Distributed Vector Database</h1>
 <blockquote><p>Production-grade, distributed vector DB capable of storing &amp; querying **trillions of high-dimensional vectors** with **low-latency ANN** at massive scale. Built for AI coding tools, RAG, and semantic search.</p></blockquote>
@@ -35,43 +35,43 @@ footer{color:#57606a;font-size:13px;padding:24px 32px}
 <li>Supporting **multi-tenancy, RBAC, observability, disaster recovery**</li>
 <li>SOLID, 12-factor, horizontally scalable, cloud-native</li>
 <h2>Architecture (Layered Microservices)</h2>
-<p>&lt;pre&gt;&lt;code class=&quot;language-&quot;&gt;Client / External Systems  →  REST | gRPC | GraphQL | WebSocket | Kafka Consumer</p>
-<p>↓</p>
-<p>API Gateway Layer          →  Rate Limiting | Auth (JWT/OAuth2) | LB | Routing | Circuit Breaker | Versioning</p>
-<p>↓</p>
-<p>Core Service Layer         →  Ingest Service | Query Service | Index Manager | Namespace Manager | Replication Coordinator | Compaction Service</p>
-<p>↓</p>
-<p>Storage Engine Layer       →  HNSW/IVF-PQ/ScaNN Shards (10-50B vectors, 3x repl) | WAL | Segment Store (Tiered) | Metadata Store (PostgreSQL → JSON)</p>
-<p>↓</p>
-<p>Infrastructure &amp;amp; Platform  →  Kubernetes | S3 | CDN/DNS | Prometheus/Grafana/Jaeger/ELK&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-">Client / External Systems  →  REST | gRPC | GraphQL | WebSocket | Kafka Consumer
+         ↓
+API Gateway Layer          →  Rate Limiting | Auth (JWT/OAuth2) | LB | Routing | Circuit Breaker | Versioning
+         ↓
+Core Service Layer         →  Ingest Service | Query Service | Index Manager | Namespace Manager | Replication Coordinator | Compaction Service
+         ↓
+Storage Engine Layer       →  HNSW/IVF-PQ/ScaNN Shards (10-50B vectors, 3x repl) | WAL | Segment Store (Tiered) | Metadata Store (PostgreSQL → JSON)
+         ↓
+Infrastructure &amp; Platform  →  Kubernetes | S3 | CDN/DNS | Prometheus/Grafana/Jaeger/ELK</code></pre>
 <p>See `deploy/k8s/deployment.yaml` for K8s + HPA.</p>
 <h2>Quickstart</h2>
-<p>&lt;pre&gt;&lt;code class=&quot;language-bash&quot;&gt;pip install -e .          # or pip install -e .[dev,ann]</p>
-<p>vsector serve --reload     # REST http://localhost:8080  gRPC :50051</p>
-<h1>another shell</h1>
-<p>python examples/quickstart.py&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-bash">pip install -e .          # or pip install -e .[dev,ann]
+vsector serve --reload     # REST http://localhost:8080  gRPC :50051
+# another shell
+python examples/quickstart.py</code></pre>
 <h3>REST example</h3>
-<p>&lt;pre&gt;&lt;code class=&quot;language-bash&quot;&gt;curl -X POST http://localhost:8080/v1/namespaces -H &amp;quot;X-API-Key: test-key&amp;quot; \</p>
-<p>-H &amp;quot;Content-Type: application/json&amp;quot; -d &amp;#x27;{&amp;quot;name&amp;quot;:&amp;quot;products&amp;quot;,&amp;quot;dimension&amp;quot;:1536,&amp;quot;index_type&amp;quot;:&amp;quot;HNSW&amp;quot;}&amp;#x27;</p>
-<p>curl -X POST http://localhost:8080/v1/vectors/upsert -H &amp;quot;X-API-Key: test-key&amp;quot; \</p>
-<p>-d &amp;#x27;{&amp;quot;namespace&amp;quot;:&amp;quot;products&amp;quot;,&amp;quot;vectors&amp;quot;:[{&amp;quot;vector&amp;quot;:[0.1,0.2,...],&amp;quot;metadata&amp;quot;:{&amp;quot;category&amp;quot;:&amp;quot;books&amp;quot;}}]}&amp;#x27;</p>
-<p>curl -X POST http://localhost:8080/v1/vectors/query -H &amp;quot;X-API-Key: test-key&amp;quot; \</p>
-<p>-d &amp;#x27;{&amp;quot;namespace&amp;quot;:&amp;quot;products&amp;quot;,&amp;quot;vector&amp;quot;:[0.1,0.2,...],&amp;quot;top_k&amp;quot;:10,&amp;quot;filters&amp;quot;:{&amp;quot;category&amp;quot;:{&amp;quot;$eq&amp;quot;:&amp;quot;books&amp;quot;}}}&amp;#x27;&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/v1/namespaces -H &quot;X-API-Key: test-key&quot; \
+  -H &quot;Content-Type: application/json&quot; -d &#x27;{&quot;name&quot;:&quot;products&quot;,&quot;dimension&quot;:1536,&quot;index_type&quot;:&quot;HNSW&quot;}&#x27;
+curl -X POST http://localhost:8080/v1/vectors/upsert -H &quot;X-API-Key: test-key&quot; \
+  -d &#x27;{&quot;namespace&quot;:&quot;products&quot;,&quot;vectors&quot;:[{&quot;vector&quot;:[0.1,0.2,...],&quot;metadata&quot;:{&quot;category&quot;:&quot;books&quot;}}]}&#x27;
+curl -X POST http://localhost:8080/v1/vectors/query -H &quot;X-API-Key: test-key&quot; \
+  -d &#x27;{&quot;namespace&quot;:&quot;products&quot;,&quot;vector&quot;:[0.1,0.2,...],&quot;top_k&quot;:10,&quot;filters&quot;:{&quot;category&quot;:{&quot;$eq&quot;:&quot;books&quot;}}}&#x27;</code></pre>
 <h3>Python SDK</h3>
-<p>&lt;pre&gt;&lt;code class=&quot;language-python&quot;&gt;from vsector.api.sdk import VsectorClient</p>
-<p>client = VsectorClient(api_key=&amp;quot;test-key&amp;quot;)</p>
-<p>client.create_namespace(&amp;quot;demo&amp;quot;, dimension=1536)</p>
-<p>client.upsert(&amp;quot;demo&amp;quot;, [{&amp;quot;vector&amp;quot;: [...], &amp;quot;metadata&amp;quot;: {&amp;quot;k&amp;quot;: &amp;quot;v&amp;quot;}}])</p>
-<p>res = client.query(&amp;quot;demo&amp;quot;, vector=[...], top_k=10)&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-python">from vsector.api.sdk import VsectorClient
+client = VsectorClient(api_key=&quot;test-key&quot;)
+client.create_namespace(&quot;demo&quot;, dimension=1536)
+client.upsert(&quot;demo&quot;, [{&quot;vector&quot;: [...], &quot;metadata&quot;: {&quot;k&quot;: &quot;v&quot;}}])
+res = client.query(&quot;demo&quot;, vector=[...], top_k=10)</code></pre>
 <h2>Module-by-Module Spec</h2>
 <h3>Module 1: Data Model &amp; Schema — `vsector/models/`</h3>
-<p>&lt;pre&gt;&lt;code class=&quot;language-python&quot;&gt;class VectorRecord:</p>
-<p>id: UUID; namespace: str; vector: List[float]; dimension: int</p>
-<p>metadata: Dict[str, Any]; created_at, updated_at, version:int</p>
-<p>ttl: Optional[datetime]; tags: List[str]; source_system:str; checksum:str</p>
-<p>class Namespace:</p>
-<p>name, dimension, distance_metric{COSINE,EUCLIDEAN,DOT_PRODUCT,MANHATTAN}</p>
-<p>index_type{HNSW,IVF_PQ,FLAT,SCANN}, replication_factor(default 3), shard_count, compression{NONE,PQ,SQ8,BF16}&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-python">class VectorRecord:
+    id: UUID; namespace: str; vector: List[float]; dimension: int
+    metadata: Dict[str, Any]; created_at, updated_at, version:int
+    ttl: Optional[datetime]; tags: List[str]; source_system:str; checksum:str
+class Namespace:
+    name, dimension, distance_metric{COSINE,EUCLIDEAN,DOT_PRODUCT,MANHATTAN}
+    index_type{HNSW,IVF_PQ,FLAT,SCANN}, replication_factor(default 3), shard_count, compression{NONE,PQ,SQ8,BF16}</code></pre>
 <h3>Module 2: Distributed Sharding — `vsector/sharding/`</h3>
 <li>**Rendezvous Hashing (HRW)** for `shard_key = hash(namespace+record_id)`, 256 vnodes/node</li>
 <li>Hot-shard detection, auto-split at 50B vectors</li>
@@ -106,21 +106,21 @@ footer{color:#57606a;font-size:13px;padding:24px 32px}
 <li>**6B gRPC** `proto/vsector.proto` → `VectorDBService` with Upsert (client stream), Query, BatchQuery (bidi), Delete, Fetch, WatchNamespace (server stream), gRPC-Web, reflection, deadline propagation</li>
 <li>**6C Kafka** `vsector.api.events.EventBus` with `AIOKafkaProducer/Consumer`, topics `vsector.&lt;ns&gt;.&lt;event&gt;`, group consumer → IngestService</li>
 <h2>Project Layout</h2>
-<p>&lt;pre&gt;&lt;code class=&quot;language-&quot;&gt;vsector/</p>
-<p>models/       # VectorRecord, Namespace</p>
-<p>sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator, Placement/RoutingDecision (VS-12)</p>
-<p>cluster/      # ClusterMembershipManager, ClusterNode, membership lifecycle (VS-11)</p>
-<p>index/        # BaseIndex, Flat, HNSW, IVF-PQ, lifecycle, factory</p>
-<p>storage/      # WAL, SegmentStore (MemTable/SSTable tiered), MetadataStore</p>
-<p>ingest/       # IngestService (write path)</p>
-<p>query/        # QueryEngine (read path)</p>
-<p>api/          # rest.py (FastAPI), grpc_server.py, events.py (Kafka), sdk.py, websocket.py, schemas.py</p>
-<p>gateway/      # auth.py (JWT/API-Key/rate limit/circuit breaker)</p>
-<p>infra/        # config.py (12-factor), logging.py, metrics.py</p>
-<p>deploy/k8s/     # deployment.yaml (HPA 3-20), configmap.yaml</p>
-<p>examples/       # quickstart.py, client_example.py</p>
-<p>tests/          # test_*.py</p>
-<p>proto/vsector.proto&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-">vsector/
+  models/       # VectorRecord, Namespace
+  sharding/     # HRW, ConsistentHashRing, Shard, Router, Coordinator, Placement/RoutingDecision (VS-12)
+  cluster/      # ClusterMembershipManager, ClusterNode, membership lifecycle (VS-11)
+  index/        # BaseIndex, Flat, HNSW, IVF-PQ, lifecycle, factory
+  storage/      # WAL, SegmentStore (MemTable/SSTable tiered), MetadataStore
+  ingest/       # IngestService (write path)
+  query/        # QueryEngine (read path)
+  api/          # rest.py (FastAPI), grpc_server.py, events.py (Kafka), sdk.py, websocket.py, schemas.py
+  gateway/      # auth.py (JWT/API-Key/rate limit/circuit breaker)
+  infra/        # config.py (12-factor), logging.py, metrics.py
+deploy/k8s/     # deployment.yaml (HPA 3-20), configmap.yaml
+examples/       # quickstart.py, client_example.py
+tests/          # test_*.py
+proto/vsector.proto</code></pre>
 <h2>Configuration (12-factor via env `VSECTOR_*`)</h2>
 <p>See `.env.example` and `vsector/infra/config.py`. Key vars: `VSECTOR_DATA_DIR`, `VSECTOR_NODE_ID` (stable local node identity for shard ownership), `VSECTOR_CLUSTER_ID` (stable cluster identity), `VSECTOR_KAFKA_BOOTSTRAP_SERVERS`, `VSECTOR_ETCD_ENDPOINTS`, `VSECTOR_RATE_LIMIT_RPS`, `VSECTOR_SHARD_MAX_VECTORS`, `VSECTOR_WAL_SEGMENT_BYTES`, etc.</p>
 <h2>Observability</h2>
@@ -128,27 +128,31 @@ footer{color:#57606a;font-size:13px;padding:24px 32px}
 <li>Grafana dashboards (`deploy/grafana/`)</li>
 <li>Jaeger tracing stub (`OTEL_ENDPOINT`), ELK logging</li>
 <h2>Deploy</h2>
-<p>&lt;pre&gt;&lt;code class=&quot;language-bash&quot;&gt;docker build -t vsector:0.1.0 .</p>
-<p>docker-compose up --build   # vsector + kafka + etcd + prometheus + grafana</p>
-<p>kubectl apply -f deploy/k8s/&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-bash">docker build -t vsector:0.1.0 .
+docker-compose up --build   # vsector + kafka + etcd + prometheus + grafana
+kubectl apply -f deploy/k8s/</code></pre>
 <h2>Development</h2>
-<p>&lt;pre&gt;&lt;code class=&quot;language-bash&quot;&gt;make install   # pip install -e .[dev]</p>
-<p>make proto     # regenerate gRPC stubs</p>
-<p>make test      # pytest</p>
-<p>make lint      # ruff check</p>
-<p>make run       # vsector serve --reload&lt;/code&gt;&lt;/pre&gt;</p>
+<pre><code class="language-bash">make install   # pip install -e .[dev]
+make proto     # regenerate gRPC stubs
+make test      # pytest
+make lint      # ruff check
+make run       # vsector serve --reload</code></pre>
 <p>Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_query.py` `test_api.py` `test_shard_lifecycle.py` `test_cluster_membership.py` `test_placement_routing.py`</p>
 <h2>Distributed Capabilities Implemented vs Not Implemented</h2>
-<p>Implemented (VS-10 → VS-12): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing.</p>
-<p>Not implemented (future: VS-13 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration, automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion, distributed result merging. A `REMOTE` routing decision is a decision only — no cross-node transport is executed. Membership state and health never masquerade as these capabilities.</p>
+<p>Implemented (VS-10 → VS-14): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing, explicit validated shard-migration lifecycle (`PENDING → … → COMPLETED`) with SHA-256-verified real data movement over per-node storage roots (VS-13), and durable migration CRUD on the shared metadata store with a read-only `recommend_rebalance()` recommendation (VS-14).</p>
+<p>Not implemented (future: VS-15 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration (networked), automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion, distributed result merging. A `REMOTE` routing decision is a decision only — no cross-node transport is executed. Membership state and health never masquerade as these capabilities.</p>
 <h2>Roadmap / Production Hardening</h2>
-<li>VS-13 — Shard Migration &amp; Rebalancing (next capability)</li>
-<li>Replace `MetadataStore` JSON with PostgreSQL + migrations</li>
-<li>Replace `EtcdStore` in-memory with real etcd + gossip</li>
-<li>S3 tier for cold SSTables, CDC + disaster recovery</li>
-<li>RBAC per-namespace, multi-tenancy isolation, mTLS for inter-service</li>
-<li>ScaNN index, BF16/SQ8 quantization</li>
-<li>Full re-ranking with cross-encoder</li>
+<p>See `docs/ROADMAP.md` (milestones VS-15 → GA 1.0 with a timeline) and `docs/ARCHITECTURE.md` (present vs target architecture and capability coverage).</p>
+<li>VS-15 — Real-etcd metadata spine (default, with liveness leases)</li>
+<li>VS-16 — Data-plane RPC transport (executable `REMOTE` routing)</li>
+<li>VS-17 — Control-plane linearization (Raft for ownership/migration/membership commits)</li>
+<li>VS-18/19 — Replica promotion + failover, active health probing</li>
+<li>VS-20/21 — Automatic rebalancing scheduler, distributed query fan-out + merge</li>
+<li>VS-22 — Replace `MetadataStore` JSON with PostgreSQL + migrations</li>
+<li>VS-23 — S3 tier for cold SSTables, CDC + disaster recovery</li>
+<li>VS-24/25 — Multi-tenancy isolation, per-namespace RBAC, mTLS for inter-service</li>
+<li>VS-26/27 — ScaNN index, BF16/SQ8 quantization, full re-ranking with cross-encoder</li>
+<li>VS-28/29 — Scale-out validation (p99 &lt;50ms @1M, &lt;200ms @1T) and GA certification</li>
 <h2>License</h2>
 <p>MIT — see [LICENSE](LICENSE)</p>
 <footer>Generated by docs/gen.py · static Pages build</footer>

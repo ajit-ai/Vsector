@@ -21,9 +21,116 @@ footer{color:#57606a;font-size:13px;padding:24px 32px}
 </head>
 <body>
 <header><strong>Vsector</strong> — vector sharding cluster ·
-<a href="./">README</a> · <a href="roadmap.html">ROADMAP</a></header>
+<a href="./">README</a> · <a href="architecture.html">ARCHITECTURE</a> · <a href="roadmap.html">ROADMAP</a></header>
 <main>
-<p>&quot;vsector GA 1.0.0&quot;</p>
+<h1>Vsector Roadmap — VS-15 → GA 1.0</h1>
+<blockquote><p>Status anchor: **VS-14 complete** (Sep 2026). Last delivered: durable shard-migration</p></blockquote>
+<blockquote><p>CRUD on the shared etcd store (merge `52031f7`). This roadmap covers everything up to</p></blockquote>
+<blockquote><p>and including **VSector GA 1.0**, then lists a brief post-GA vision.</p></blockquote>
+<h2>Where we are</h2>
+<p>Implemented through **VS-14**: explicit shard lifecycle + ownership (VS-10), cluster</p>
+<p>membership + node identity (VS-11), placement / routing decisions (VS-12), digest-verified</p>
+<p>shard migration over real durable per-node storage roots (VS-13), durable migration store</p>
+<p>on the shared metadata backend (VS-14). Replication health/readiness, WAL recovery, gateway</p>
+<p>auth/RBAC/mTLS, index engines (HNSW/IVF-PQ + ScaNN simulation), benchmarks (ann, Jepsen,</p>
+<p>soak, chaos), helm/k8s/terraform, and a GitHub Pages docs site also exist.</p>
+<p>The gap to a *distributed* GA is now precisely one axis: **the network**. Decisions exist;</p>
+<p>execution across nodes does not.</p>
+<h2>Definition of Done — GA 1.0</h2>
+<p>A release is **Vsector 1.0.0** only when all of these hold:</p>
+<p>1. **Executable routing.** A `REMOTE` routing decision (VS-12) executes over the data</p>
+<p>plane — a remote write is ACKed only after real durable apply, never fabricated.</p>
+<p>2. **Real replication + failover.** Replication runs over the network with quorum acks;</p>
+<p>an unavailable primary can be failed over to a caught-up replica through an auditable,</p>
+<p>deterministic path. Restart never fabricates state.</p>
+<p>3. **Durable control plane.** Real etcd (3+ nodes) is the default metadata spine with</p>
+<p>liveness leases; migration/membership/ownership commits are linearized (Raft where</p>
+<p>needed). No JSON-file backend in production deployments.</p>
+<p>4. **Operational migration.** Automatic rebalancing runs via the validated VS-13 migration</p>
+<p>lifecycle with throttle, pause/resume, and safety limits — never blind ownership moves.</p>
+<p>5. **Distributed query.** Cross-node fan-out + deterministic top-K merge with</p>
+<p>`EVENTUAL|STRONG` consistency selection.</p>
+<p>6. **Scale claim is measured.** p99 read latency `&lt;50ms @1M vectors` and `&lt;200ms @1T</p>
+<p>vectors`, recall above the documented baseline on ann-benchmarks, verified by soak,</p>
+<p>chaos, and Jepsen as part of the GA gate. Version string is aligned repo-wide.</p>
+<p>7. **Durability &amp; recovery.** PostgreSQL metadata, S3 cold tier + CDC, backup/restore/</p>
+<p>PITR documented and exercised.</p>
+<p>8. **Security posture.** Per-namespace RBAC scoping, mTLS enforced on all inter-node</p>
+<p>traffic, audit/SOC2/GDPR artifacts aligned with the documented claims.</p>
+<h2>Milestones to GA 1.0</h2>
+<h3>Phase 1 — Control-plane spine (VS-15 → VS-17)</h3>
+<table>
+<thead><tr><th>VS</th><th>Milestone</th><th>Scope</th><th>Exit gate</th></tr></thead>
+<tbody>
+<tr><td>**VS-15**</td><td>Real-etcd metadata spine</td><td>Real `Etcd3Store` as default; etcd watch + gossip as primary invalidation; JSON-file only for single-node dev; node liveness lease registration</td><td>3-node etcd, shard/membership/migration metadata survives restarts, watch-driven cache invalidation verified cross-node</td></tr>
+<tr><td>**VS-16**</td><td>Data-plane RPC transport</td><td>gRPC transport serving remote write/read/migrate ops; deadlines, retries, idempotency; preserves VS-12 invariants (no ack without apply); mTLS-ready</td><td>`REMOTE` decision actually executes against the true owner; no fabricated success paths</td></tr>
+<tr><td>**VS-17**</td><td>Control-plane linearization</td><td>Raft log over the metadata spine for membership votes, ownership commits, migration commits; leader-election protocol for the control plane; lease failover for membership</td><td>Concurrent ownership/migration commits serialize; a restarted control-plane leader never forks metadata</td></tr>
+</tbody></table>
+<h3>Phase 2 — Data-plane autonomy (VS-18 → VS-21)</h3>
+<table>
+<thead><tr><th>VS</th><th>Milestone</th><th>Scope</th><th>Exit gate</th></tr></thead>
+<tbody>
+<tr><td>**VS-18**</td><td>Replica promotion &amp; failover</td><td>Failover decision on health + lease expiry; promotion via the existing `DRAINING`/ownership boundary; never auto-promotes an uncaught-up replica</td><td>Kill-primary chaos test: failover converges, no lost acked writes, audit trail complete</td></tr>
+<tr><td>**VS-19**</td><td>Active health probing</td><td>`ProbeManager`: live probe/readiness; feeds VS-09 health; gates routing; expires leases on missed beats</td><td>Probe-derived health equals runtime health in tests; routing refuses unprobed/expired owners</td></tr>
+<tr><td>**VS-20**</td><td>Rebalance controller</td><td>Operationalizes `recommend_rebalance()`: scheduled, throttled migrations with pause/resume, per-namespace policy, safety limits</td><td>Rebalance runs unattended, respects limits, uses only the validated migration lifecycle</td></tr>
+<tr><td>**VS-21**</td><td>Distributed query</td><td>Cross-node query decision execution, `QueryFanout` + deterministic `MergeTopK`, consistency selection, deadline propagation</td><td>Multi-node query returns identical top-K to single-node on same data</td></tr>
+</tbody></table>
+<h3>Phase 3 — Durability &amp; operations (VS-22 → VS-23)</h3>
+<table>
+<thead><tr><th>VS</th><th>Milestone</th><th>Scope</th><th>Exit gate</th></tr></thead>
+<tbody>
+<tr><td>**VS-22**</td><td>PostgreSQL metadata</td><td>Replace JSON `MetadataStore` with PostgreSQL + alembic migrations (schema exists); namespaces, quotas, audit, metering</td><td>Migrations apply cleanly; metadata survives pod loss; no vector data in SQL</td></tr>
+<tr><td>**VS-23**</td><td>S3 tiering + CDC + DR</td><td>Cold SSTables to S3 with lifecycle, CDC capture for DR, backup/restore + PITR runbook, cross-region replay</td><td>Restore drill validated; deleted data removed per retention (GDPR)</td></tr>
+</tbody></table>
+<h3>Phase 4 — Tenancy, security, query quality (VS-24 → VS-27)</h3>
+<table>
+<thead><tr><th>VS</th><th>Milestone</th><th>Scope</th><th>Exit gate</th></tr></thead>
+<tbody>
+<tr><td>**VS-24**</td><td>Multi-tenancy</td><td>Per-tenant quotas, rate limits, isolation, metering, per-tenant keys; tenant-aware routing</td><td>Tenant A cannot exceed quota or read tenant B; metering reconciles</td></tr>
+<tr><td>**VS-25**</td><td>Security to GA</td><td>Per-namespace RBAC (OPA scoping), mTLS on every inter-node op, secret rotation, audit alignment</td><td>Policy tests + security review pass; no plaintext secrets in transit</td></tr>
+<tr><td>**VS-26**</td><td>Index completeness</td><td>Real ScaNN backend or equivalent GPU path; BF16/SQ8 quantization in the index layer; filter-aware ANN variants</td><td>Recall/cost numbers published vs competitors on ann-benchmarks</td></tr>
+<tr><td>**VS-27**</td><td>Re-ranking &amp; hybrid</td><td>Full cross-encoder + MMR, hybrid BM25/vector, late interaction</td><td>Rerank SLOs defined and met; hybrid improves recall over ANN alone</td></tr>
+</tbody></table>
+<h3>Phase 5 — Scale-out validation &amp; GA (VS-28 → VS-29)</h3>
+<table>
+<thead><tr><th>VS</th><th>Milestone</th><th>Scope</th><th>Exit gate</th></tr></thead>
+<tbody>
+<tr><td>**VS-28**</td><td>Scale-out validation</td><td>1M → 1B → 100B → 1T vectors; soak, chaos, Jepsen live; autoscaling + HPA tuning; benchmark report published</td><td>p99 `&lt;50ms @1M`, `&lt;200ms @1T`; Jepsen failures zero; soak clean across upgrades</td></tr>
+<tr><td>**VS-29**</td><td>GA hardening &amp; certification</td><td>Repo-wide version alignment, SDK feature parity (py/ts/rust/java/go), Helm charts GA, SLOs/alerts/runbooks, security + docs review, release trains</td><td>All DoD items above green; tagged `v1.0.0`; docs site current</td></tr>
+</tbody></table>
+<h2>Timeline (indicative — assumes a small team, ~2 FTEs)</h2>
+<table>
+<thead><tr><th>Phase</th><th>Milestones</th><th>Window</th><th>Cumulative</th></tr></thead>
+<tbody>
+<tr><td>Phase 1</td><td>VS-15…VS-17</td><td>Q4 2026</td><td>Q4 2026</td></tr>
+<tr><td>Phase 2</td><td>VS-18…VS-21</td><td>Q1 2027</td><td>Q1 2027</td></tr>
+<tr><td>Phase 3</td><td>VS-22…VS-23</td><td>Q2 2027</td><td>Q2 2027</td></tr>
+<tr><td>Phase 4</td><td>VS-24…VS-27</td><td>Q3 2027</td><td>Q3 2027</td></tr>
+<tr><td>Phase 5</td><td>VS-28…VS-29</td><td>Q4 2027</td><td>**GA 1.0 ~ Q4 2027**</td></tr>
+</tbody></table>
+<p>Dates are anchors, not promises: each milestone is gated by its exit criteria, and a</p>
+<p>milestone that cannot prove its gate is not &quot;done.&quot; VS-15/VS-16 (real etcd + RPC) and</p>
+<p>VS-28 (the measured scale claim) are the two highest-risk items; they should be started</p>
+<p>earliest (VS-15) and continuously de-risked (bench perf work can begin immediately).</p>
+<h2>Execution principles for the remaining work</h2>
+<p>1. **Milestones are shippable atoms.** Each VS lands with tests, migration of existing</p>
+<p>tests, docs section, and observability additions.</p>
+<p>2. **Invariants precede optimization.** The eight invariants in `docs/ARCHITECTURE.md`</p>
+<p>gate every merge. No &quot;quick&quot; path that bypasses a validated transition.</p>
+<p>3. **Transport is one abstraction.** VS-16&#x27;s RPC is reused for replication, migration,</p>
+<p>and query fan-out; there is exactly one network boundary to secure (VS-25).</p>
+<p>4. **Truthfulness is measured.** Every automated failover, migration, and promotion</p>
+<p>leaves an observable record, and restart tests assert nothing is re-invented.</p>
+<p>5. **No scale claims without benchmarks.** The Phase 5 gate is a measurement gate.</p>
+<h2>Non-goals of GA 1.0 (post-GA vision)</h2>
+<li>Multi-writer / multi-primary writes within a shard</li>
+<li>Proprietary GPU-resident index beyond a single TensorFlow-ScaNN path</li>
+<li>Online schema change / in-place re-embedding pipelines</li>
+<li>Fully synchronous cross-region writes (async CDC at GA; synchronous at a future release)</li>
+<li>External data-source connectors beyond the documented SDKs/system integration layer</li>
+<h2>See also</h2>
+<li>`docs/ARCHITECTURE.md` — present vs target architecture and the capability coverage matrix.</li>
+<li>`README.md` — module spec, config, and the implemented-vs-not tables (kept in sync each milestone).</li>
 <footer>Generated by docs/gen.py · static Pages build</footer>
 </main>
 </body>
