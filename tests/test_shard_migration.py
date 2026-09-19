@@ -322,10 +322,9 @@ class TestTransfer:
        src_before = _logical_state(env["transfer"], "node-0", shard)
        m = _full_run(env, m.migration_id)
        shard = env["store"].get("sh-000")
-       src = _logical_state(env["transfer"], "node-0", shard)
        dst = _logical_state(env["transfer"], "node-1", shard)
        assert len(dst.records) == len(src_before.records)
-       assert src.deleted_ids == dst.deleted_ids
+       assert dst.deleted_ids == src_before.deleted_ids
        assert m.source_digest == m.target_digest
 
 

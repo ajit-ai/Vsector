@@ -183,19 +183,24 @@ Tests: `tests/test_models.py` `test_sharding.py` `test_index.py` `test_ingest_qu
 
 ## Distributed Capabilities Implemented vs Not Implemented
 
-Implemented (VS-10 → VS-12): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing.
+Implemented (VS-10 → VS-14): explicit shard lifecycle (`CREATING → ACTIVE → DRAINING → OFFLINE`), primary-owner/replica ownership, ownership- and lifecycle-aware routing, durable shard + cluster metadata, stable cluster identity, explicit node membership lifecycle (`JOINING → ACTIVE → DRAINING → REMOVED`), membership persistence, ownership/replica validation against known membership, deterministic cluster APIs/observability (`GET /cluster*`), truthful restart behavior, deterministic record → shard placement, explicit local-owner/remote-owned routing decisions (`LOCAL`/`REMOTE`/`UNAVAILABLE`), membership-aware owner validation in decisions, lifecycle-aware read/write/query decisions, read-only placement observability (`GET /cluster/placement`, `GET /v1/namespaces/{ns}/placement|shards`), side-effect-free routing, explicit validated shard-migration lifecycle (`PENDING → … → COMPLETED`) with SHA-256-verified real data movement over per-node storage roots (VS-13), and durable migration CRUD on the shared metadata store with a read-only `recommend_rebalance()` recommendation (VS-14).
 
-Not implemented (future: VS-13 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration, automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion, distributed result merging. A `REMOTE` routing decision is a decision only — no cross-node transport is executed. Membership state and health never masquerade as these capabilities.
+Not implemented (future: VS-15 and later): Raft/Paxos consensus, leader election, automatic failover, automatic shard migration (networked), automatic rebalancing, cross-node transport / distributed RPC, distributed service discovery, background health probing, automatic replica promotion, distributed result merging. A `REMOTE` routing decision is a decision only — no cross-node transport is executed. Membership state and health never masquerade as these capabilities.
 
 ## Roadmap / Production Hardening
 
-- VS-13 — Shard Migration & Rebalancing (next capability)
-- Replace `MetadataStore` JSON with PostgreSQL + migrations
-- Replace `EtcdStore` in-memory with real etcd + gossip
-- S3 tier for cold SSTables, CDC + disaster recovery
-- RBAC per-namespace, multi-tenancy isolation, mTLS for inter-service
-- ScaNN index, BF16/SQ8 quantization
-- Full re-ranking with cross-encoder
+See `docs/ROADMAP.md` (milestones VS-15 → GA 1.0 with a timeline) and `docs/ARCHITECTURE.md` (present vs target architecture and capability coverage).
+
+- VS-15 — Real-etcd metadata spine (default, with liveness leases)
+- VS-16 — Data-plane RPC transport (executable `REMOTE` routing)
+- VS-17 — Control-plane linearization (Raft for ownership/migration/membership commits)
+- VS-18/19 — Replica promotion + failover, active health probing
+- VS-20/21 — Automatic rebalancing scheduler, distributed query fan-out + merge
+- VS-22 — Replace `MetadataStore` JSON with PostgreSQL + migrations
+- VS-23 — S3 tier for cold SSTables, CDC + disaster recovery
+- VS-24/25 — Multi-tenancy isolation, per-namespace RBAC, mTLS for inter-service
+- VS-26/27 — ScaNN index, BF16/SQ8 quantization, full re-ranking with cross-encoder
+- VS-28/29 — Scale-out validation (p99 <50ms @1M, <200ms @1T) and GA certification
 
 ## License
 
